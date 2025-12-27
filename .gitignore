@@ -1,9 +1,75 @@
-.env.env
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-__pycache__/__pycache__/
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
 
-*.pyc*.pyc
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/config.toml
 
-.DS_Store.DS_Store
+# Logs
+*.log
+background_service.log
+streamlit.log
 
-*.log*.log
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# Test files (optional - remove if you want to include tests)
+# test_*.py
+
+# Old/backup files
+*_fixed.py
+*_backup.py
+*_old.py
+

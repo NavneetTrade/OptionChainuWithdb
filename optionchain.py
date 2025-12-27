@@ -13,6 +13,14 @@ from scipy.stats import norm
 import os
 import toml
 
+# Import database module for production-grade storage
+try:
+    from database import TimescaleDBManager
+    DB_AVAILABLE = True
+except ImportError:
+    DB_AVAILABLE = False
+    st.warning("Database module not available. Running in direct API mode.")
+
 # Optional auto-refresh
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -94,201 +102,206 @@ def get_credentials():
             st.error(f"Error accessing credentials: {str(inner_e)}")
             return None
 
-# Upstox API endpoints
-BASE_URL = "https://api.upstox.com/v2"
-AUTH_URL = "https://api-v2.upstox.com/login/authorization/dialog"
-TOKEN_URL = "https://api-v2.upstox.com/login/authorization/token"
+# Import UpstoxAPI from standalone module
+try:
+    from upstox_api import UpstoxAPI
+except ImportError:
+    # Fallback to local definition if module not available
+    # Upstox API endpoints
+    BASE_URL = "https://api.upstox.com/v2"
+    AUTH_URL = "https://api-v2.upstox.com/login/authorization/dialog"
+    TOKEN_URL = "https://api-v2.upstox.com/login/authorization/token"
 
-class UpstoxAPI:
-    def __init__(self):
-        self.access_token = None
-        self.refresh_token = None
+    class UpstoxAPI:
+        def __init__(self):
+            self.access_token = None
+            self.refresh_token = None
         
-    def get_auth_url(self, api_key, redirect_uri):
-        """Generate authorization URL with proper encoding"""
-        rurl = urllib.parse.quote(redirect_uri, safe="")
-        uri = f'{AUTH_URL}?response_type=code&client_id={api_key}&redirect_uri={rurl}'
-        return uri
-    
-    def get_access_token(self, auth_code, api_key, api_secret, redirect_uri):
-        """Exchange authorization code for access token"""
-        try:
-            payload = {
-                'code': auth_code,
-                'client_id': api_key,
-                'client_secret': api_secret,
-                'redirect_uri': redirect_uri,
-                'grant_type': 'authorization_code'
-            }
-            
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json'
-            }
-            
-            response = requests.post(TOKEN_URL, data=payload, headers=headers)
-            if response.status_code == 200:
-                token_data = response.json()
-                self.access_token = token_data.get('access_token')
-                self.refresh_token = token_data.get('refresh_token')
-                return True, token_data
-            else:
-                return False, response.json() if response.text else f"HTTP {response.status_code}"
-        except Exception as e:
-            return False, str(e)
-    
-    def refresh_access_token(self, api_key, api_secret, refresh_token):
-        """Refresh access token using refresh token"""
-        try:
-            payload = {
-                'refresh_token': refresh_token,
-                'client_id': api_key,
-                'client_secret': api_secret,
-                'grant_type': 'refresh_token'
-            }
-            
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json'
-            }
-            
-            response = requests.post(TOKEN_URL, data=payload, headers=headers)
-            if response.status_code == 200:
-                token_data = response.json()
-                self.access_token = token_data.get('access_token')
-                new_refresh_token = token_data.get('refresh_token')
-                if new_refresh_token:
-                    self.refresh_token = new_refresh_token
-                return True, token_data
-            else:
-                return False, response.json() if response.text else f"HTTP {response.status_code}"
-        except Exception as e:
-            return False, str(e)
-    
-    def get_option_contracts(self, instrument_key, expiry_date=None):
-        """Get option contracts for an underlying symbol"""
-        if not self.access_token:
-            return None, "Access token not available"
+        def get_auth_url(self, api_key, redirect_uri):
+            """Generate authorization URL with proper encoding"""
+            rurl = urllib.parse.quote(redirect_uri, safe="")
+            uri = f'{AUTH_URL}?response_type=code&client_id={api_key}&redirect_uri={rurl}'
+            return uri
         
-        try:
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'Accept': 'application/json'
-            }
-            
-            url = f"{BASE_URL}/option/contract"
-            params = {'instrument_key': instrument_key}
-            
-            if expiry_date:
-                params['expiry_date'] = expiry_date
-            
-            response = requests.get(url, headers=headers, params=params)
-            
-            if response.status_code == 200:
-                return response.json(), None
-            else:
-                return None, response.json() if response.text else f"HTTP {response.status_code}"
-        except Exception as e:
-            return None, str(e)
-    
-    def get_pc_option_chain(self, instrument_key, expiry_date):
-        """Get Put-Call option chain data using the correct endpoint"""
-        if not self.access_token:
-            return None, "Access token not available"
+        def get_access_token(self, auth_code, api_key, api_secret, redirect_uri):
+            """Exchange authorization code for access token"""
+            try:
+                payload = {
+                    'code': auth_code,
+                    'client_id': api_key,
+                    'client_secret': api_secret,
+                    'redirect_uri': redirect_uri,
+                    'grant_type': 'authorization_code'
+                }
+                
+                headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Accept': 'application/json'
+                }
+                
+                response = requests.post(TOKEN_URL, data=payload, headers=headers)
+                if response.status_code == 200:
+                    token_data = response.json()
+                    self.access_token = token_data.get('access_token')
+                    self.refresh_token = token_data.get('refresh_token')
+                    return True, token_data
+                else:
+                    return False, response.json() if response.text else f"HTTP {response.status_code}"
+            except Exception as e:
+                return False, str(e)
         
-        try:
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'Accept': 'application/json'
-            }
-            
-            url = f"{BASE_URL}/option/chain"
-            params = {
-                'instrument_key': instrument_key,
-                'expiry_date': expiry_date
-            }
-            
-            response = requests.get(url, headers=headers, params=params)
-            
-            if response.status_code == 200:
-                return response.json(), None
-            else:
-                return None, response.json() if response.text else f"HTTP {response.status_code}"
-        except Exception as e:
-            return None, str(e)
-    
-    def get_option_greeks(self, instrument_keys):
-        """Get option Greeks for specific instruments"""
-        if not self.access_token:
-            return None, "Access token not available"
+        def refresh_access_token(self, api_key, api_secret, refresh_token):
+            """Refresh access token using refresh token"""
+            try:
+                payload = {
+                    'refresh_token': refresh_token,
+                    'client_id': api_key,
+                    'client_secret': api_secret,
+                    'grant_type': 'refresh_token'
+                }
+                
+                headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Accept': 'application/json'
+                }
+                
+                response = requests.post(TOKEN_URL, data=payload, headers=headers)
+                if response.status_code == 200:
+                    token_data = response.json()
+                    self.access_token = token_data.get('access_token')
+                    new_refresh_token = token_data.get('refresh_token')
+                    if new_refresh_token:
+                        self.refresh_token = new_refresh_token
+                    return True, token_data
+                else:
+                    return False, response.json() if response.text else f"HTTP {response.status_code}"
+            except Exception as e:
+                return False, str(e)
         
-        try:
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'Accept': 'application/json'
-            }
+        def get_option_contracts(self, instrument_key, expiry_date=None):
+            """Get option contracts for an underlying symbol"""
+            if not self.access_token:
+                return None, "Access token not available"
             
-            url = f"{BASE_URL}/option/greek"
-            if isinstance(instrument_keys, str):
-                instrument_keys = [instrument_keys]
-            
-            params = {'instrument_key': ','.join(instrument_keys)}
-            
-            response = requests.get(url, headers=headers, params=params)
-            
-            if response.status_code == 200:
-                return response.json(), None
-            else:
-                return None, response.json() if response.text else f"HTTP {response.status_code}"
-        except Exception as e:
-            return None, str(e)
-    
-    def get_market_data_feed(self, instrument_key, interval='1minute'):
-        """Get market data feed"""
-        if not self.access_token:
-            return None, "Access token not available"
+            try:
+                headers = {
+                    'Authorization': f'Bearer {self.access_token}',
+                    'Accept': 'application/json'
+                }
+                
+                url = f"{BASE_URL}/option/contract"
+                params = {'instrument_key': instrument_key}
+                
+                if expiry_date:
+                    params['expiry_date'] = expiry_date
+                
+                response = requests.get(url, headers=headers, params=params)
+                
+                if response.status_code == 200:
+                    return response.json(), None
+                else:
+                    return None, response.json() if response.text else f"HTTP {response.status_code}"
+            except Exception as e:
+                return None, str(e)
         
-        try:
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'Accept': 'application/json'
-            }
+        def get_pc_option_chain(self, instrument_key, expiry_date):
+            """Get Put-Call option chain data using the correct endpoint"""
+            if not self.access_token:
+                return None, "Access token not available"
             
-            url = f"{BASE_URL}/market-quote/ohlc"
-            params = {
-                'instrument_key': instrument_key,
-                'interval': interval
-            }
-            
-            response = requests.get(url, headers=headers, params=params)
-            
-            if response.status_code == 200:
-                return response.json(), None
-            else:
-                return None, response.json() if response.text else f"HTTP {response.status_code}"
-        except Exception as e:
-            return None, str(e)
-    
-    def get_profile(self):
-        """Get user profile to test token"""
-        if not self.access_token:
-            return None, "Access token not available"
+            try:
+                headers = {
+                    'Authorization': f'Bearer {self.access_token}',
+                    'Accept': 'application/json'
+                }
+                
+                url = f"{BASE_URL}/option/chain"
+                params = {
+                    'instrument_key': instrument_key,
+                    'expiry_date': expiry_date
+                }
+                
+                response = requests.get(url, headers=headers, params=params)
+                
+                if response.status_code == 200:
+                    return response.json(), None
+                else:
+                    return None, response.json() if response.text else f"HTTP {response.status_code}"
+            except Exception as e:
+                return None, str(e)
         
-        try:
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'Accept': 'application/json'
-            }
+        def get_option_greeks(self, instrument_keys):
+            """Get option Greeks for specific instruments"""
+            if not self.access_token:
+                return None, "Access token not available"
             
-            url = f"{BASE_URL}/user/profile"
-            response = requests.get(url, headers=headers)
+            try:
+                headers = {
+                    'Authorization': f'Bearer {self.access_token}',
+                    'Accept': 'application/json'
+                }
+                
+                url = f"{BASE_URL}/option/greek"
+                if isinstance(instrument_keys, str):
+                    instrument_keys = [instrument_keys]
+                
+                params = {'instrument_key': ','.join(instrument_keys)}
+                
+                response = requests.get(url, headers=headers, params=params)
+                
+                if response.status_code == 200:
+                    return response.json(), None
+                else:
+                    return None, response.json() if response.text else f"HTTP {response.status_code}"
+            except Exception as e:
+                return None, str(e)
+        
+        def get_market_data_feed(self, instrument_key, interval='1minute'):
+            """Get market data feed"""
+            if not self.access_token:
+                return None, "Access token not available"
             
-            if response.status_code == 200:
-                return response.json(), None
-            else:
-                return None, response.json() if response.text else f"HTTP {response.status_code}"
-        except Exception as e:
-            return None, str(e)
+            try:
+                headers = {
+                    'Authorization': f'Bearer {self.access_token}',
+                    'Accept': 'application/json'
+                }
+                
+                url = f"{BASE_URL}/market-quote/ohlc"
+                params = {
+                    'instrument_key': instrument_key,
+                    'interval': interval
+                }
+                
+                response = requests.get(url, headers=headers, params=params)
+                
+                if response.status_code == 200:
+                    return response.json(), None
+                else:
+                    return None, response.json() if response.text else f"HTTP {response.status_code}"
+            except Exception as e:
+                return None, str(e)
+        
+        def get_profile(self):
+            """Get user profile to test token"""
+            if not self.access_token:
+                return None, "Access token not available"
+            
+            try:
+                headers = {
+                    'Authorization': f'Bearer {self.access_token}',
+                    'Accept': 'application/json'
+                }
+                
+                url = f"{BASE_URL}/user/profile"
+                response = requests.get(url, headers=headers)
+                
+                if response.status_code == 200:
+                    return response.json(), None
+                else:
+                    return None, response.json() if response.text else f"HTTP {response.status_code}"
+            except Exception as e:
+                return None, str(e)
 
 def format_number(num: float) -> str:
     """Format large numbers for summary display"""
@@ -577,6 +590,17 @@ def main():
         st.session_state.option_chain_data = None
     if 'access_token' not in st.session_state:
         st.session_state.access_token = None
+    if 'db_manager' not in st.session_state and DB_AVAILABLE:
+        try:
+            st.session_state.db_manager = TimescaleDBManager()
+            st.session_state.use_database = True
+        except Exception as e:
+            st.session_state.use_database = False
+            st.session_state.db_manager = None
+            st.warning(f"Database connection failed: {e}. Using direct API mode.")
+    elif not DB_AVAILABLE:
+        st.session_state.use_database = False
+        st.session_state.db_manager = None
         
     # Get pre-configured developer credentials
     try:
@@ -631,7 +655,7 @@ def main():
         
         # Analysis settings
         st.subheader("Analysis Settings")
-        itm_count = st.radio("ITM Strikes", [3, 5], index=1, key="itm_count_radio")
+        itm_count = st.radio("ITM Strikes", [1, 2, 3, 5], index=2, key="itm_count_radio")
         risk_free_rate = st.number_input("Risk-free Rate (%)", value=5.84, min_value=0.0, max_value=15.0, step=0.1) / 100
         
         # Auto-refresh settings
@@ -745,112 +769,167 @@ def main():
                     st.sidebar.error("Failed to refresh token")
                     st.sidebar.json(result)
     
-    # Main content area - FIXED: Create a single persistent container for all content
-    main_content_container = st.container()
-    
+    # Main content area - Create tabs for different views
     if st.session_state.upstox_api.access_token:
-        with main_content_container:
-            # Auto-refresh implementation - FIXED: Only trigger refresh, don't duplicate UI
-            if (AUTORFR and 
-                st.session_state.auto_refresh_enabled and 
-                is_market_open() and 
-                'selected_symbol' in st.session_state and 
-                st.session_state.selected_expiry):
-                
-                count = st_autorefresh(interval=refresh_interval * 1000, limit=None, key="data_refresh")
-                
-                # Auto-fetch only triggers data refresh, UI remains the same
-                if count > 0:
-                    fo_instruments = get_fo_instruments()
-                    instrument_key = fo_instruments.get(st.session_state.selected_symbol)
-                    if instrument_key:
-                        auto_fetch_option_chain(instrument_key, st.session_state.selected_symbol, 
-                                              st.session_state.selected_expiry, itm_count, risk_free_rate)
-            
-            st.success("Ready to fetch options data!")
-            
-            # F&O Instrument Selection
-            st.header("Select F&O Instrument")
-            
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                # Get F&O instruments
-                fo_instruments = get_fo_instruments()
-                
-                # Find current index
-                try:
-                    current_index = list(fo_instruments.keys()).index(st.session_state.selected_symbol)
-                except ValueError:
-                    current_index = 0
-                
-                selected_symbol = st.selectbox(
-                    "Select Symbol", 
-                    list(fo_instruments.keys()), 
-                    index=current_index,
-                    key="symbol_selectbox"
-                )
-                if selected_symbol != st.session_state.selected_symbol:
-                    st.session_state.selected_symbol = selected_symbol
-                
-                instrument_key = fo_instruments[selected_symbol]
-            
-            with col2:
-                # Fetch available expiries
-                contracts_data, error = st.session_state.upstox_api.get_option_contracts(instrument_key)
-                expiry_dates = []
-                if contracts_data and 'data' in contracts_data:
-                    expiry_dates = sorted({c['expiry'] for c in contracts_data['data'] if 'expiry' in c})
-                
-                if expiry_dates:
-                    # Find current expiry index
-                    current_expiry_index = 0
-                    if st.session_state.selected_expiry in expiry_dates:
-                        current_expiry_index = expiry_dates.index(st.session_state.selected_expiry)
+        # Create tabs
+        tab1, tab2 = st.tabs(["📈 Option Chain Analysis", "📊 Sentiment Dashboard"])
+        
+        with tab1:
+            main_content_container = st.container()
+            with main_content_container:
+                # Auto-refresh implementation - FIXED: Only trigger refresh, don't duplicate UI
+                if (AUTORFR and 
+                    st.session_state.auto_refresh_enabled and 
+                    is_market_open() and 
+                    'selected_symbol' in st.session_state and 
+                    st.session_state.selected_expiry):
                     
-                    selected_expiry = st.selectbox(
-                        "Select Expiry", 
-                        expiry_dates, 
-                        index=current_expiry_index,
-                        key="expiry_selectbox"
-                    )
-                    st.session_state.selected_expiry = selected_expiry
+                    count = st_autorefresh(interval=refresh_interval * 1000, limit=None, key="data_refresh")
+                    
+                    # Auto-fetch only triggers data refresh, UI remains the same
+                    if count > 0:
+                        fo_instruments = get_fo_instruments()
+                        instrument_key = fo_instruments.get(st.session_state.selected_symbol)
+                        if instrument_key:
+                            auto_fetch_option_chain(instrument_key, st.session_state.selected_symbol, 
+                                                  st.session_state.selected_expiry, itm_count, risk_free_rate)
+                
+                # Show data source status
+                if st.session_state.use_database:
+                    st.success("✅ Production Mode: Reading from TimescaleDB (Background service active)")
                 else:
-                    st.warning("No expiry dates found. Try another symbol.")
-                    selected_expiry = None
+                    st.info("ℹ️ Direct API Mode: Fetching data directly from Upstox API")
+                
+                # F&O Instrument Selection
+                st.header("Select F&O Instrument")
             
-            with col3:
-                st.write("**Selected:**")
-                st.write(f"Symbol: {selected_symbol}")
-                st.write(f"Key: {instrument_key}")
-                st.write(f"Expiry: {selected_expiry}")
+                col1, col2, col3 = st.columns(3)
                 
-            # Manual fetch button (always available)
-            if selected_expiry:
-                col_fetch1, col_fetch2 = st.columns([1, 1])
+                with col1:
+                    # Get F&O instruments
+                    fo_instruments = get_fo_instruments()
+                    
+                    # Find current index
+                    try:
+                        current_index = list(fo_instruments.keys()).index(st.session_state.selected_symbol)
+                    except ValueError:
+                        current_index = 0
+                    
+                    # Check if we need to switch symbol (from Sentiment Dashboard button)
+                    if 'switch_to_option_chain' in st.session_state and st.session_state.switch_to_option_chain:
+                        if 'selected_symbol' in st.session_state:
+                            try:
+                                current_index = list(fo_instruments.keys()).index(st.session_state.selected_symbol)
+                            except ValueError:
+                                current_index = 0
+                            st.session_state.switch_to_option_chain = False
+                        else:
+                            current_index = 0
+                    else:
+                        try:
+                            current_index = list(fo_instruments.keys()).index(st.session_state.selected_symbol)
+                        except ValueError:
+                            current_index = 0
+                    
+                    selected_symbol = st.selectbox(
+                        "Select Symbol", 
+                        list(fo_instruments.keys()), 
+                        index=current_index,
+                        key="symbol_selectbox"
+                    )
+                    if selected_symbol != st.session_state.selected_symbol:
+                        st.session_state.selected_symbol = selected_symbol
+                    
+                    instrument_key = fo_instruments[selected_symbol]
                 
-                with col_fetch1:
-                    if st.button("Get Option Chain", type="primary", key="manual_fetch"):
-                        fetch_and_display_option_chain(instrument_key, selected_symbol, selected_expiry, itm_count, risk_free_rate)
+                with col2:
+                    # Fetch available expiries
+                    contracts_data, error = st.session_state.upstox_api.get_option_contracts(instrument_key)
+                    expiry_dates = []
+                    if contracts_data and 'data' in contracts_data:
+                        expiry_dates = sorted({c['expiry'] for c in contracts_data['data'] if 'expiry' in c})
+                    
+                    if expiry_dates:
+                        # Find current expiry index
+                        current_expiry_index = 0
+                        if st.session_state.selected_expiry in expiry_dates:
+                            current_expiry_index = expiry_dates.index(st.session_state.selected_expiry)
+                        
+                        selected_expiry = st.selectbox(
+                            "Select Expiry", 
+                            expiry_dates, 
+                            index=current_expiry_index,
+                            key="expiry_selectbox"
+                        )
+                        st.session_state.selected_expiry = selected_expiry
+                    else:
+                        st.warning("No expiry dates found. Try another symbol.")
+                        selected_expiry = None
                 
-                with col_fetch2:
-                    if st.session_state.last_data_update:
-                        st.info(f"Last updated: {st.session_state.last_data_update} IST")
-            
-            # FIXED: Display data in the same container - no separate placeholder needed
-            if st.session_state.option_chain_data:
-                display_option_chain_dashboard(
-                    st.session_state.option_chain_data,
-                    selected_symbol,
-                    selected_expiry,
-                    itm_count,
-                    risk_free_rate
-                )
+                with col3:
+                    st.write("**Selected:**")
+                    st.write(f"Symbol: {selected_symbol}")
+                    st.write(f"Key: {instrument_key}")
+                    st.write(f"Expiry: {selected_expiry}")
+                    
+                # Manual fetch/load button (always available)
+                if selected_expiry:
+                    col_fetch1, col_fetch2 = st.columns([1, 1])
+                    
+                    with col_fetch1:
+                        button_label = "Load from Database" if st.session_state.use_database else "Get Option Chain"
+                        if st.button(button_label, type="primary", key="manual_fetch"):
+                            fetch_and_display_option_chain(instrument_key, selected_symbol, selected_expiry, itm_count, risk_free_rate)
+                    
+                    with col_fetch2:
+                        if st.session_state.last_data_update:
+                            data_source = "Database" if st.session_state.use_database else "API"
+                            st.info(f"Last updated: {st.session_state.last_data_update} IST ({data_source})")
+                        # Auto-load from database if available
+                        elif st.session_state.use_database:
+                            # Try to auto-load on symbol/expiry change
+                            data, timestamp = load_option_chain_from_db(selected_symbol, selected_expiry)
+                            if data:
+                                st.session_state.option_chain_data = data
+                                if timestamp:
+                                    st.session_state.last_data_update = format_ist_time(timestamp)
+                
+                # FIXED: Display data in the same container - no separate placeholder needed
+                if st.session_state.option_chain_data:
+                    display_option_chain_dashboard(
+                        st.session_state.option_chain_data,
+                        selected_symbol,
+                        selected_expiry,
+                        itm_count,
+                        risk_free_rate
+                    )
+        
+        with tab2:
+            # Sentiment Dashboard Tab
+            if st.session_state.use_database and st.session_state.db_manager:
+                try:
+                    from sentiment_dashboard import display_sentiment_dashboard
+                    display_sentiment_dashboard(st.session_state.db_manager)
+                except ImportError:
+                    st.error("Sentiment dashboard module not found")
+                except Exception as e:
+                    st.error(f"Error loading sentiment dashboard: {str(e)}")
+            else:
+                st.warning("⚠️ Sentiment Dashboard requires database connection")
+                st.info("""
+                The Sentiment Dashboard shows all symbols with extreme sentiment scores:
+                - **Strong Bullish**: Sentiment score > 20
+                - **Strong Bearish**: Sentiment score < -20
+                
+                Please ensure:
+                1. Database is connected (TimescaleDB)
+                2. Background service is running
+                3. Data has been collected for multiple symbols
+                """)
     
     else:
-        with main_content_container:
-            st.error("Developer access token not available or has expired.")
-            st.info("""
+        st.error("Developer access token not available or has expired.")
+        st.info("""
             Please configure your developer credentials in .streamlit/secrets.toml with this format:
             ```toml
             [upstox]
@@ -864,10 +943,10 @@ def main():
             2. Use the Upstox developer portal
             3. Generate a permanent access token
             4. Add it to your secrets.toml
-            """)
-            st.warning("Contact the developer if you need access to this application.")
-            
-            st.markdown("""
+        """)
+        st.warning("Contact the developer if you need access to this application.")
+        
+        st.markdown("""
             ### Setup Guide:
             
             1. **Authorization Process:**
@@ -928,9 +1007,35 @@ def get_fo_instruments():
             "BANKNIFTY": "NSE_INDEX|Nifty Bank"
         }
 
+def load_option_chain_from_db(symbol, expiry):
+    """Load option chain data from database"""
+    if not st.session_state.use_database or not st.session_state.db_manager:
+        return None, None
+    
+    try:
+        data = st.session_state.db_manager.get_latest_option_chain(symbol, expiry)
+        if data:
+            timestamp = st.session_state.db_manager.get_latest_timestamp(symbol, expiry)
+            return data, timestamp
+        return None, None
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return None, None
+
 def auto_fetch_option_chain(instrument_key, symbol, expiry, itm_count, risk_free_rate):
-    """Auto fetch option chain when conditions are met - FIXED: Only updates data, no UI duplication"""
-    if st.session_state.upstox_api.access_token:
+    """Auto fetch option chain when conditions are met - ALWAYS uses database when available"""
+    # ALWAYS try database first - background service continuously updates it
+    if st.session_state.use_database:
+        data, timestamp = load_option_chain_from_db(symbol, expiry)
+        if data:
+            st.session_state.option_chain_data = data
+            if timestamp:
+                st.session_state.last_data_update = format_ist_time(timestamp)
+            return
+    
+    # Only use API if database is not available (not connected)
+    # Don't fetch from API if database is connected but has no data - let background service handle it
+    if not st.session_state.use_database and st.session_state.upstox_api.access_token:
         # Fetch data silently without creating new UI elements
         option_data, error = st.session_state.upstox_api.get_pc_option_chain(instrument_key, expiry)
         
@@ -941,19 +1046,40 @@ def auto_fetch_option_chain(instrument_key, symbol, expiry, itm_count, risk_free
 
 def fetch_and_display_option_chain(instrument_key, symbol, expiry, itm_count, risk_free_rate):
     """Fetch and display option chain data - FIXED: No separate placeholder needed"""
-    with st.spinner(f"Fetching option chain for {symbol}..."):
-        option_data, error = st.session_state.upstox_api.get_pc_option_chain(
-            instrument_key, expiry
-        )
-        
-        if option_data and error is None and 'data' in option_data:
-            st.session_state.option_chain_data = option_data['data']
-            current_time = get_ist_now()
-            st.session_state.last_data_update = format_ist_time(current_time)
-            st.success(f"Data fetched successfully at {st.session_state.last_data_update} IST")
-            # UI will automatically update through the session state
-        else:
-            st.error(f"Failed to fetch option chain: {error}")
+    # Try to load from database first
+    if st.session_state.use_database:
+        with st.spinner(f"Loading option chain for {symbol} from database..."):
+            data, timestamp = load_option_chain_from_db(symbol, expiry)
+            if data:
+                st.session_state.option_chain_data = data
+                if timestamp:
+                    st.session_state.last_data_update = format_ist_time(timestamp)
+                st.success(f"Data loaded from database (updated at {st.session_state.last_data_update} IST)")
+                return
+            else:
+                # Database is available but no data found - don't fetch from API
+                # Let background service handle it to ensure both tabs use same data source
+                st.warning(f"⚠️ No data in database for {symbol} yet.")
+                st.info("💡 Background service is continuously fetching data. Please wait a moment and try again.")
+                st.info("💡 This ensures both Option Chain Analysis and Sentiment Dashboard use the same data source.")
+                return
+    
+    # Only use API if database is not available (not connected)
+    if not st.session_state.use_database:
+        with st.spinner(f"Fetching option chain for {symbol} from API..."):
+            option_data, error = st.session_state.upstox_api.get_pc_option_chain(
+                instrument_key, expiry
+            )
+            
+            if option_data and error is None and 'data' in option_data:
+                st.session_state.option_chain_data = option_data['data']
+                current_time = get_ist_now()
+                st.session_state.last_data_update = format_ist_time(current_time)
+                st.success(f"Data fetched successfully at {st.session_state.last_data_update} IST")
+                st.warning("⚠️ Using API data. Sentiment Dashboard uses database data, so values may differ.")
+                # UI will automatically update through the existing display logic
+            else:
+                st.error(f"Failed to fetch option chain: {error}")
 
 def display_option_chain_dashboard(data, symbol, expiry, itm_count, risk_free_rate):
     """Main dashboard display function - Fixed to prevent blank rows"""
@@ -962,10 +1088,57 @@ def display_option_chain_dashboard(data, symbol, expiry, itm_count, risk_free_ra
             st.warning("No option chain data available")
             return
         
-        # Extract spot price
-        spot_price = data[0].get('underlying_spot_price', 0) if data else 0
+        # Extract spot price - try multiple methods
+        spot_price = 0
+        
+        # Method 1: Try to get from first strike's underlying_spot_price
+        if data and len(data) > 0:
+            spot_price = data[0].get('underlying_spot_price', 0)
+        
+        # Method 2: If from database, try to get from database query
+        if spot_price == 0 and st.session_state.use_database and st.session_state.db_manager:
+            try:
+                # Get spot price from database for this symbol and expiry
+                with st.session_state.db_manager.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT spot_price 
+                            FROM option_chain_data 
+                            WHERE symbol = %s AND expiry_date = %s 
+                            AND spot_price > 0
+                            ORDER BY timestamp DESC 
+                            LIMIT 1
+                        """, (symbol, expiry))
+                        result = cur.fetchone()
+                        if result and result[0] and result[0] > 0:
+                            spot_price = float(result[0])
+            except Exception as e:
+                pass  # Continue to next method
+        
+        # Method 3: Use middle strike as approximation
+        if spot_price == 0 and data and len(data) > 0:
+            strikes = []
+            for strike_data in data:
+                strike = strike_data.get('strike_price', 0)
+                if strike > 0:
+                    strikes.append(strike)
+            
+            if strikes:
+                strikes.sort()
+                spot_price = strikes[len(strikes) // 2]  # Use middle strike
+        
+        # Method 4: Use first valid strike as last resort
+        if spot_price == 0 and data and len(data) > 0:
+            for strike_data in data:
+                strike = strike_data.get('strike_price', 0)
+                if strike > 0:
+                    spot_price = strike
+                    break
+        
         if spot_price == 0:
-            st.error("Unable to get spot price from data")
+            st.error("Unable to get spot price from data. Please try refreshing or check if data is available.")
+            with st.expander("Debug: Data Structure"):
+                st.json(data[0] if data else "No data")
             return
         
         # Calculate time to expiry
@@ -1058,9 +1231,46 @@ def display_option_chain_dashboard(data, symbol, expiry, itm_count, risk_free_ra
         bucket_summary = calculate_bucket_summaries(filtered_table, atm_strike, spot_price)
         pcr_data = calculate_comprehensive_pcr(bucket_summary)
         
-        display_bucket_summaries(bucket_summary, pcr_data)
+        # Get gamma blast signal first
+        gamma_blast_info = None
+        if 'current_gex_data' in st.session_state:
+            try:
+                gex_df = pd.DataFrame(st.session_state.current_gex_data)
+                market_context = {'regime': calculate_market_regime(None, gex_df, filtered_table)}
+                blast_signal, blast_direction, reasons, entry_signal, _ = detect_gamma_blast(
+                    filtered_table, spot_price, gex_df, None, market_context
+                )
+                gamma_blast_info = {
+                    'signal': blast_signal,
+                    'direction': blast_direction,
+                    'reasons': reasons,
+                    'entry_signal': entry_signal
+                }
+            except Exception as e:
+                st.error(f"Error getting gamma blast signal: {str(e)}")
+        
+        display_bucket_summaries(bucket_summary, pcr_data, gamma_blast_info)
         
         sentiment_analysis = calculate_comprehensive_sentiment_score(filtered_table, bucket_summary, pcr_data, spot_price)
+        
+        # Store sentiment score in database if available (so Sentiment Dashboard matches)
+        if st.session_state.use_database and st.session_state.db_manager:
+            try:
+                st.session_state.db_manager.insert_sentiment_score(
+                    symbol=symbol,
+                    expiry_date=expiry,
+                    sentiment_score=sentiment_analysis['final_score'],
+                    sentiment=sentiment_analysis['sentiment'],
+                    confidence=sentiment_analysis['confidence'],
+                    spot_price=spot_price,
+                    pcr_oi=pcr_data.get('OVERALL_PCR_OI'),
+                    pcr_chgoi=pcr_data.get('OVERALL_PCR_CHGOI'),
+                    pcr_volume=pcr_data.get('OVERALL_PCR_VOLUME')
+                )
+            except Exception as e:
+                # Silently fail - don't interrupt the UI
+                pass
+        
         display_sentiment_analysis(sentiment_analysis, symbol)
         
         display_option_chain_table(filtered_table, atm_strike, spot_price)
@@ -1336,8 +1546,8 @@ def get_pcr_color(pcr_value):
     else:
         return "#ff9800"  # Orange - Neutral
 
-def display_bucket_summaries(bucket_summary, pcr_data):
-    """Display bucket summaries with enhanced color coding"""
+def display_bucket_summaries(bucket_summary, pcr_data, gamma_blast_info=None):
+    """Display bucket summaries with enhanced color coding and gamma blast signals"""
     st.subheader("Bucket Summaries with Greeks Analysis")
     
     left, middle, right = st.columns([1, 1, 1])
@@ -1362,6 +1572,28 @@ def display_bucket_summaries(bucket_summary, pcr_data):
             </div>
         </div>
         """
+        
+    # Display Gamma Blast Signal if available
+    if gamma_blast_info and 'signal' in gamma_blast_info:
+        signal_colors = {
+            "Gamma Blast ENTRY SIGNAL - Upside": "#059669",
+            "Gamma Blast ENTRY SIGNAL - Downside": "#dc2626",
+            "Gamma Blast ENTRY SIGNAL - Bidirectional": "#7c3aed"
+        }
+        color = signal_colors.get(gamma_blast_info['signal'], "#6b7280")
+        
+        st.markdown(f"""
+        <div style="background: linear-gradient(90deg, {color}15, transparent); 
+             padding: 10px; border-radius: 8px; border-left: 4px solid {color}; 
+             margin-bottom: 10px;">
+            <div style="color: {color}; font-weight: bold;">
+                {gamma_blast_info['signal']}
+            </div>
+            <div style="font-size: 0.9em;">
+                Direction: {gamma_blast_info.get('direction', 'NEUTRAL')}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
     def display_pcr_metric(label, value, signal=""):
         pcr_color = get_pcr_color(value)
