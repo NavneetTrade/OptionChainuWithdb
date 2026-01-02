@@ -7,6 +7,7 @@ import time
 import logging
 import signal
 import sys
+import math
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import pytz
@@ -14,10 +15,19 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import toml
+import numpy as np
+from dataclasses import dataclass
 
 from database import TimescaleDBManager
 from upstox_api import UpstoxAPI
-from websocket_manager import UpstoxWebSocketManager
+
+# Optional WebSocket import - not required since we're using REST API only
+try:
+    from websocket_manager import UpstoxWebSocketManager
+    WEBSOCKET_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    WEBSOCKET_AVAILABLE = False
+    UpstoxWebSocketManager = None
 
 # Configure logging
 logging.basicConfig(
@@ -37,18 +47,299 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone('Asia/Kolkata')
 
 
+@dataclass
+class GammaBlastSignal:
+    """Real-time gamma blast signal with adaptive thresholds"""
+    probability: float  # 0-1
+    direction: str  # UP/DOWN/NEUTRAL
+    confidence: str  # LOW/MEDIUM/HIGH/CRITICAL
+    time_to_blast_min: int
+    triggers: List[str]  # What caused high probability
+    risk_level: str  # LOW/ELEVATED/HIGH/EXTREME
+
+
+class AdaptiveGammaBlastDetector:
+    """
+    Adaptive gamma blast detector using statistical z-scores
+    instead of constant thresholds
+    """
+    
+    def __init__(self, lookback_periods: int = 20):
+        self.lookback = lookback_periods
+        
+    @staticmethod
+    def calculate_z_score_or_threshold(current: float, historical: List[float], fallback_threshold: float = 0) -> float:
+        """Calculate z-score with fallback for insufficient data
+        
+        Args:
+            current: Current value to evaluate
+            historical: Historical values for statistical comparison
+            fallback_threshold: Absolute threshold to use when insufficient data
+            
+        Returns:
+            Z-score if sufficient data (>=10), percentile-based score (>=3), 
+            or threshold-based score (0/1/-1) for sparse data
+        """
+        if len(historical) >= 10:  # Use z-score if sufficient data
+            mean = np.mean(historical)
+            std = np.std(historical)
+            return (current - mean) / std if std > 0 else 0
+        elif len(historical) >= 3:  # Use percentile-based for sparse data
+            p75 = np.percentile(historical, 75)
+            p25 = np.percentile(historical, 25)
+            if current > p75:
+                return 1  # Above 75th percentile
+            elif current < p25:
+                return -1  # Below 25th percentile
+            else:
+                return 0  # Within normal range
+        else:  # Fallback to absolute threshold for very sparse data
+            if fallback_threshold > 0:
+                return 1 if current > fallback_threshold else 0
+            else:
+                return 0
+    
+    def detect_gamma_blast(
+        self,
+        symbol: str,
+        current_data: dict,
+        historical_data: List[dict]
+    ) -> GammaBlastSignal:
+        """
+        Detect gamma blast using adaptive statistical thresholds
+        
+        Args:
+            symbol: Trading symbol
+            current_data: Current metrics {iv, oi, gamma_conc, gex, etc}
+            historical_data: List of past metrics (last 20+ periods)
+        """
+        
+        probability = 0.0
+        triggers = []
+        
+        # Extract current metrics
+        curr_iv = current_data.get('atm_iv', 0)
+        curr_oi = current_data.get('atm_oi', 0)
+        curr_gamma_conc = current_data.get('gamma_concentration', 0)
+        curr_gex = current_data.get('net_gex', 0)
+        spot = current_data.get('spot_price', 0)
+        atm_strike = current_data.get('atm_strike', 0)
+        
+        # Build historical arrays
+        hist_iv = [d.get('atm_iv', 0) for d in historical_data if d.get('atm_iv', 0) > 0]
+        hist_oi = [d.get('atm_oi', 0) for d in historical_data if d.get('atm_oi', 0) > 0]
+        hist_gamma_conc = [d.get('gamma_concentration', 0) for d in historical_data]
+        hist_gex = [d.get('net_gex', 0) for d in historical_data]
+        
+        # SIGNAL 1: IV Z-Score Spike (hybrid: z-score/percentile/threshold)
+        # Fallback threshold: IV > 30 for indices/stocks is elevated
+        iv_zscore = self.calculate_z_score_or_threshold(curr_iv, hist_iv, fallback_threshold=30)
+        
+        if len(hist_iv) >= 10:  # Z-score interpretation
+            if iv_zscore > 2.5:  # 2.5 std devs above mean
+                probability += 0.25
+                triggers.append(f"IV Spike ({iv_zscore:.1f}σ)")
+            elif iv_zscore > 2.0:
+                probability += 0.15
+                triggers.append(f"IV Elevated ({iv_zscore:.1f}σ)")
+            elif iv_zscore < -2.0:  # IV collapsing
+                probability += 0.15
+                triggers.append(f"IV Collapse ({iv_zscore:.1f}σ)")
+        elif len(hist_iv) >= 3:  # Percentile interpretation
+            if iv_zscore > 0:  # Above 75th percentile
+                probability += 0.20
+                triggers.append("IV Elevated (>P75)")
+            elif iv_zscore < 0:  # Below 25th percentile
+                probability += 0.15
+                triggers.append("IV Collapsed (<P25)")
+        elif iv_zscore > 0:  # Absolute threshold
+            probability += 0.15
+            triggers.append(f"IV High (>{curr_iv:.1f})")
+        
+        # SIGNAL 2: OI Acceleration (2nd derivative with adaptive threshold)
+        if len(historical_data) >= 3:
+            # Calculate acceleration using last 3 points
+            oi_series = [
+                historical_data[-3].get('atm_oi', 0), 
+                historical_data[-2].get('atm_oi', 0),
+                curr_oi
+            ]
+            
+            velocity_1 = oi_series[1] - oi_series[0]
+            velocity_2 = oi_series[2] - oi_series[1]
+            acceleration = velocity_2 - velocity_1
+            
+            # Build historical accelerations for z-score
+            hist_accelerations = []
+            for i in range(2, len(historical_data)):
+                v1 = historical_data[i-1].get('atm_oi', 0) - historical_data[i-2].get('atm_oi', 0)
+                v2 = historical_data[i].get('atm_oi', 0) - historical_data[i-1].get('atm_oi', 0)
+                hist_accelerations.append(v2 - v1)
+            
+            if hist_accelerations:
+                # Fallback: acceleration > 10000 for stocks, > 1000 for indices is significant
+                fallback_accel = 1000 if curr_oi < 1000000 else 10000
+                accel_zscore = self.calculate_z_score_or_threshold(acceleration, hist_accelerations, fallback_threshold=fallback_accel)
+                
+                if len(hist_accelerations) >= 10:  # Z-score interpretation
+                    if accel_zscore < -2.0:  # Rapid unwinding (2σ below mean)
+                        probability += 0.30
+                        triggers.append(f"OI Unwinding ({accel_zscore:.1f}σ)")
+                    elif accel_zscore > 2.0:  # Rapid buildup (2σ above mean)
+                        probability += 0.20
+                        triggers.append(f"OI Buildup ({accel_zscore:.1f}σ)")
+                elif len(hist_accelerations) >= 3:  # Percentile interpretation
+                    if accel_zscore < 0:  # Below 25th percentile (unwinding)
+                        probability += 0.25
+                        triggers.append("OI Unwinding (<P25)")
+                    elif accel_zscore > 0:  # Above 75th percentile (buildup)
+                        probability += 0.20
+                        triggers.append("OI Buildup (>P75)")
+                elif abs(accel_zscore) > 0:  # Absolute threshold
+                    if acceleration < 0:
+                        probability += 0.20
+                        triggers.append(f"OI Unwinding ({acceleration:.0f})")
+                    else:
+                        probability += 0.15
+                        triggers.append(f"OI Buildup ({acceleration:.0f})")
+        
+        # SIGNAL 3: Gamma Concentration Expansion (hybrid)
+        # Fallback: concentration > 60% is high clustering
+        gamma_zscore = self.calculate_z_score_or_threshold(curr_gamma_conc, hist_gamma_conc, fallback_threshold=0.6)
+        
+        if len(hist_gamma_conc) >= 10:
+            if gamma_zscore > 2.0:
+                probability += 0.20
+                triggers.append(f"Gamma Clustering ({gamma_zscore:.1f}σ)")
+        elif len(hist_gamma_conc) >= 3:
+            if gamma_zscore > 0:  # Above 75th percentile
+                probability += 0.20
+                triggers.append("Gamma Clustering (>P75)")
+        elif gamma_zscore > 0:  # Absolute threshold
+            probability += 0.15
+            triggers.append(f"High Gamma Conc ({curr_gamma_conc:.1%})")
+        
+        # SIGNAL 4: Strike Pin Risk (distance from high OI strike)
+        if atm_strike > 0:
+            distance_pct = abs(spot - atm_strike) / spot * 100
+            if distance_pct < 0.5:  # Very close to ATM
+                probability += 0.10
+                triggers.append(f"Pin Risk ({distance_pct:.2f}%)")
+        
+        # SIGNAL 5: GEX Flip Detection (crossing zero)
+        if len(hist_gex) > 0:
+            prev_gex = hist_gex[-1]
+            if (prev_gex > 0 and curr_gex < 0) or (prev_gex < 0 and curr_gex > 0):
+                probability += 0.25
+                triggers.append("GEX Flip Detected")
+        
+        # SIGNAL 6: GEX Extremes (adaptive percentile-based)
+        if len(hist_gex) >= 10:
+            gex_percentile = (sum(1 for g in hist_gex if g <= curr_gex) / len(hist_gex)) * 100
+            if gex_percentile > 90:  # Top 10% (high resistance)
+                probability += 0.15
+                triggers.append(f"Extreme GEX ({gex_percentile:.0f}th percentile)")
+            elif gex_percentile < 10:  # Bottom 10% (high support)
+                probability += 0.15
+                triggers.append(f"Extreme GEX ({gex_percentile:.0f}th percentile)")
+        
+        # Cap probability at 0.95
+        probability = min(0.95, probability)
+        
+        # DIRECTION PREDICTION using weighted signals
+        direction_score = 0
+        
+        # Put/Call OI ratio
+        ce_oi_total = current_data.get('ce_oi_total', 0)
+        pe_oi_total = current_data.get('pe_oi_total', 0)
+        pcr = pe_oi_total / ce_oi_total if ce_oi_total > 0 else 1
+        
+        if pcr < 0.7:
+            direction_score += 3  # Heavy call OI = bullish
+        elif pcr < 0.85:
+            direction_score += 1
+        elif pcr > 1.3:
+            direction_score -= 3  # Heavy put OI = bearish
+        elif pcr > 1.15:
+            direction_score -= 1
+        
+        # GEX direction (adaptive using percentile)
+        if len(hist_gex) >= 5:
+            gex_75th = np.percentile(hist_gex, 75)
+            gex_25th = np.percentile(hist_gex, 25)
+            
+            if curr_gex > gex_75th:
+                direction_score -= 2  # Strong resistance = bearish
+            elif curr_gex < gex_25th:
+                direction_score += 2  # Strong support = bullish
+        
+        # IV skew
+        ce_iv_avg = current_data.get('ce_iv_avg', 0)
+        pe_iv_avg = current_data.get('pe_iv_avg', 0)
+        if ce_iv_avg > 0 and pe_iv_avg > 0:
+            if ce_iv_avg > pe_iv_avg * 1.1:
+                direction_score -= 1  # Calls expensive = bearish expectation
+            elif pe_iv_avg > ce_iv_avg * 1.1:
+                direction_score += 1  # Puts expensive = bullish expectation
+        
+        # Determine direction
+        if direction_score >= 3:
+            direction = "UPSIDE"
+        elif direction_score <= -3:
+            direction = "DOWNSIDE"
+        else:
+            direction = "NEUTRAL"
+        
+        # CONFIDENCE based on trigger count and probability
+        if probability > 0.7 and len(triggers) >= 4:
+            confidence = "CRITICAL"
+            time_to_blast = 3  # Minutes
+        elif probability > 0.6 and len(triggers) >= 3:
+            confidence = "VERY_HIGH"
+            time_to_blast = 10
+        elif probability > 0.4:
+            confidence = "HIGH"
+            time_to_blast = 20
+        elif probability > 0.25:
+            confidence = "MEDIUM"
+            time_to_blast = 30
+        else:
+            confidence = "LOW"
+            time_to_blast = 60
+        
+        # RISK LEVEL
+        if probability > 0.75:
+            risk_level = "EXTREME"
+        elif probability > 0.6:
+            risk_level = "HIGH"
+        elif probability > 0.4:
+            risk_level = "ELEVATED"
+        else:
+            risk_level = "LOW"
+        
+        return GammaBlastSignal(
+            probability=probability,
+            direction=direction,
+            confidence=confidence,
+            time_to_blast_min=time_to_blast,
+            triggers=triggers,
+            risk_level=risk_level
+        )
+
+
 class OptionChainBackgroundService:
     """Background service for fetching option chain data for all symbols"""
     
-    def __init__(self, refresh_interval: int = 30, force_run: bool = False):
+    def __init__(self, refresh_interval: int = 180, force_run: bool = False):
         """
-        Initialize background service
+        Initialize background service - HYBRID MODE
         
         Args:
-            refresh_interval: Default refresh interval in seconds
+            refresh_interval: REST API refresh interval in seconds (180 = 3 minutes for stocks)
             force_run: If True, run even when market is closed (for testing)
         """
         self.refresh_interval = refresh_interval
+        self.index_refresh_interval = 90  # Indices refresh every 90 seconds (avoid rate limits)
         self.force_run = force_run
         self.running = False
         self.db_manager = None
@@ -56,9 +347,16 @@ class OptionChainBackgroundService:
         self.websocket_manager = None
         self.symbol_configs = {}
         self.executor = None
-        self.use_websocket = False  # Disabled - HTTP 530 errors, using REST API only
+        self.use_websocket = True  # ENABLED for real-time indices
         self.expiry_cache = {}  # Cache expiry dates to avoid repeated API calls
-        # Removed market_closed_fetched - always fetch continuously
+        
+        # WebSocket configuration for real-time indices
+        self.realtime_indices = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY']
+        self.ws_data_cache = {}  # Cache for WebSocket real-time data
+        
+        # Initialize adaptive gamma blast detector
+        self.gamma_detector = AdaptiveGammaBlastDetector(lookback_periods=20)
+        
         self._load_credentials()
         self._initialize_components()
         
@@ -114,31 +412,123 @@ class OptionChainBackgroundService:
             self.upstox_api.access_token = self.credentials['access_token']
             logger.info("Upstox API initialized")
             
-            # WebSocket disabled due to HTTP 530 errors - using REST API with aggressive rate limiting
-            if self.use_websocket:
+            # WebSocket enabled for real-time indices
+            if self.use_websocket and WEBSOCKET_AVAILABLE:
                 try:
                     self.websocket_manager = UpstoxWebSocketManager(self.credentials['access_token'])
                     self.websocket_manager.start()
                     # Wait a bit for WebSocket to connect
                     time.sleep(2)
                     if self.websocket_manager.is_connected:
-                        logger.info("WebSocket manager initialized and connected")
+                        logger.info("✅ WebSocket manager initialized and connected")
+                        # Subscribe to indices for real-time updates
+                        self._subscribe_realtime_indices()
                     else:
-                        logger.warning("WebSocket manager started but not connected. Falling back to REST API.")
+                        logger.warning("WebSocket manager started but not connected. Indices will use 3-min refresh.")
                         self.use_websocket = False
                         self.websocket_manager = None
                 except Exception as ws_error:
-                    logger.warning(f"WebSocket initialization failed: {ws_error}. Falling back to REST API only.")
+                    logger.warning(f"WebSocket initialization failed: {ws_error}. Falling back to REST API (3-min) for all symbols.")
                     self.use_websocket = False
                     self.websocket_manager = None
+            elif self.use_websocket and not WEBSOCKET_AVAILABLE:
+                logger.info("WebSocket requested but 'websockets' module not installed. Using REST API only.")
+                self.use_websocket = False
+                self.websocket_manager = None
             
             # Initialize thread pool executor with reduced workers to avoid rate limiting
-            self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="OptionChainFetcher")
-            logger.info("Thread pool executor initialized (3 workers to avoid rate limiting)")
+            # REAL-TIME OPTIMIZATION: 5 workers for parallel processing
+            self.executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="OptionChainFetcher")
+            logger.info("Thread pool executor initialized (5 workers for real-time processing)")
             
         except Exception as e:
             logger.error(f"Failed to initialize components: {e}")
             raise
+    
+    def _subscribe_realtime_indices(self):
+        """Subscribe to WebSocket for real-time index updates"""
+        if not self.websocket_manager or not self.websocket_manager.is_connected:
+            return
+        
+        try:
+            # Get instrument keys for indices
+            index_instruments = [
+                "NSE_INDEX|Nifty 50",
+                "NSE_INDEX|Nifty Bank",
+                "NSE_INDEX|Nifty Fin Service",
+                "NSE_INDEX|NIFTY MID SELECT",
+                "BSE_INDEX|SENSEX"
+            ]
+            
+            # Subscribe to indices using async
+            import asyncio
+            if self.websocket_manager.loop:
+                asyncio.run_coroutine_threadsafe(
+                    self.websocket_manager.subscribe(index_instruments, mode='ltpc'),
+                    self.websocket_manager.loop
+                )
+                logger.info(f"⚡ Subscribed to {len(index_instruments)} indices for real-time updates")
+        except Exception as e:
+            logger.error(f"Failed to subscribe to indices: {e}")
+    
+    def _get_realtime_spot_price(self, symbol: str, instrument_key: str) -> Optional[float]:
+        """Get real-time spot price from WebSocket if available"""
+        if not self.use_websocket or not self.websocket_manager:
+            return None
+        
+        try:
+            # Check if we have real-time data
+            if instrument_key in self.websocket_manager.latest_data:
+                feed_data = self.websocket_manager.latest_data[instrument_key]
+                # Extract LTP (Last Traded Price)
+                if 'ltpc' in feed_data:
+                    ltp = feed_data['ltpc'].get('ltp', 0)
+                    if ltp > 0:
+                        logger.debug(f"⚡ {symbol}: Real-time price {ltp}")
+                        return float(ltp)
+                elif 'ltp' in feed_data:
+                    return float(feed_data['ltp'])
+        except Exception as e:
+            logger.debug(f"Error getting real-time price for {symbol}: {e}")
+        
+        return None
+    
+    def _handle_websocket_tick(self, tick_data):
+        """Handle real-time WebSocket tick data for indices"""
+        try:
+            if not tick_data:
+                return
+            
+            # Extract symbol and data
+            instrument_key = tick_data.get('instrument_key', '')
+            ltp = tick_data.get('ltp', 0)
+            
+            # Map instrument key to symbol
+            instrument_map = {
+                "NSE_INDEX|Nifty 50": "NIFTY",
+                "NSE_INDEX|Nifty Bank": "BANKNIFTY",
+                "NSE_INDEX|Nifty Fin Service": "FINNIFTY",
+                "NSE_INDEX|NIFTY MID SELECT": "MIDCPNIFTY",
+                "BSE_INDEX|SENSEX": "SENSEX"
+            }
+            
+            symbol = instrument_map.get(instrument_key)
+            if not symbol or symbol not in self.realtime_indices:
+                return
+            
+            # Cache real-time data
+            self.ws_data_cache[symbol] = {
+                'spot_price': ltp,
+                'timestamp': datetime.now(IST),
+                'instrument_key': instrument_key
+            }
+            
+            # Update database with real-time spot price
+            # This will be merged with periodic option chain data
+            logger.debug(f"⚡ {symbol}: Real-time price {ltp}")
+            
+        except Exception as e:
+            logger.error(f"Error handling WebSocket tick: {e}")
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully"""
@@ -160,10 +550,12 @@ class OptionChainBackgroundService:
         market_open = datetime.strptime("09:15", "%H:%M").time()
         market_close = datetime.strptime("15:30", "%H:%M").time()
         
+        # Market is open only between 9:15 AM and 3:30 PM
+        # After 3:30 PM, return False so service stops fetching data
         return market_open <= current_time <= market_close
     
     def _get_fo_instruments(self) -> Dict[str, str]:
-        """Get F&O instruments mapping"""
+        """Get F&O instruments mapping - ONLY ACTIVE stocks with current expiry"""
         try:
             import requests
             import gzip
@@ -178,14 +570,39 @@ class OptionChainBackgroundService:
                 data = json.load(gz)
 
             df = pd.DataFrame(data)
-            fno_df = df[(df['segment'] == "NSE_FO") | (df['segment'] == "NSE_INDEX")]
-            fno_stocks = [x for x in fno_df['name'].unique()]
-
-            fo_instruments = {row['asset_symbol']: row['asset_key'] 
-                            for _, row in fno_df.iterrows() 
-                            if row['name'] in fno_stocks}
-
-            # Add indices
+            
+            # Filter for NSE_FO segment only (exclude NSE_INDEX, we'll add manually)
+            fno_df = df[df['segment'] == "NSE_FO"].copy()
+            
+            # CRITICAL FIX: Get only stocks with FUTURE expiry (current month)
+            # This filters out delisted/junk symbols that have no active contracts
+            if 'expiry' in fno_df.columns:
+                # Filter for contracts with expiry dates (active stocks)
+                fno_df = fno_df[fno_df['expiry'].notna()].copy()
+                
+                # Get the nearest expiry for each symbol
+                fno_df['expiry_date'] = pd.to_datetime(fno_df['expiry'])
+                current_expiries = fno_df.groupby('name')['expiry_date'].min().reset_index()
+                active_stocks = current_expiries['name'].unique().tolist()
+                
+                logger.info(f"Found {len(active_stocks)} active F&O stocks with current expiry")
+            else:
+                # Fallback: use unique names
+                active_stocks = fno_df['name'].unique().tolist()
+                logger.warning("No expiry column found, using all symbols (may include junk)")
+            
+            # Build instrument mapping ONLY for active stocks
+            # Use asset_symbol (trading symbol) not name (company name)
+            fo_instruments = {}
+            for stock in active_stocks:
+                stock_data = fno_df[fno_df['name'] == stock].iloc[0]
+                if 'asset_symbol' in stock_data:
+                    symbol = stock_data['asset_symbol']  # Use trading symbol (e.g., "RELIANCE")
+                    # Use the asset_key directly from NSE data (e.g., "NSE_EQ|INE002A01018")
+                    instrument_key = stock_data['asset_key']
+                    fo_instruments[symbol] = instrument_key
+            
+            # Add indices manually
             fo_instruments.update({
                 "NIFTY": "NSE_INDEX|Nifty 50",
                 "BANKNIFTY": "NSE_INDEX|Nifty Bank",
@@ -194,9 +611,12 @@ class OptionChainBackgroundService:
                 "SENSEX": "BSE_INDEX|SENSEX"
             })
             
+            logger.info(f"Total symbols to monitor: {len(fo_instruments)} ({len(active_stocks)} stocks + 5 indices)")
             return fo_instruments
+            
         except Exception as e:
             logger.error(f"Failed to get F&O instruments: {e}")
+            # Fallback to indices only
             return {
                 "NIFTY": "NSE_INDEX|Nifty 50",
                 "BANKNIFTY": "NSE_INDEX|Nifty Bank",
@@ -205,32 +625,25 @@ class OptionChainBackgroundService:
             }
     
     def _get_active_symbols(self) -> List[Dict]:
-        """Get list of active symbols - always fetch ALL F&O instruments"""
-        # Always fetch ALL F&O instruments (like UI does) to ensure we process all symbols
-        logger.info("Fetching all F&O instruments for background processing...")
-        fo_instruments = self._get_fo_instruments()
+        """
+        Get list of all F&O symbols to monitor dynamically from Upstox
+        Automatically fetches all active F&O symbols (typically ~215 stocks + 5 indices)
         
-        if not fo_instruments:
-            logger.warning("Failed to fetch F&O instruments, using default list")
-            default_symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
-            fo_instruments = {
-                "NIFTY": "NSE_INDEX|Nifty 50",
-                "BANKNIFTY": "NSE_INDEX|Nifty Bank",
-                "FINNIFTY": "NSE_INDEX|Nifty Fin Service",
-                "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT"
-            }
+        Returns:
+            List of symbol configurations
+        """
+        # Get all F&O instruments dynamically
+        all_symbols = self._get_fo_instruments()
         
         symbols = []
         symbol_count = 0
         
-        # Process all F&O instruments
-        for symbol, instrument_key in fo_instruments.items():
+        # Add all symbols
+        for symbol, instrument_key in all_symbols.items():
+            if not instrument_key or not symbol:
+                continue
+            
             try:
-                # Only process if it's a valid F&O instrument
-                # Skip if instrument_key is None or empty
-                if not instrument_key or not symbol:
-                    continue
-                
                 # Store in database
                 if self.db_manager and self.db_manager.pool:
                     self.db_manager.update_symbol_config(symbol, instrument_key, self.refresh_interval)
@@ -242,38 +655,40 @@ class OptionChainBackgroundService:
                     'refresh_interval': self.refresh_interval
                 })
                 symbol_count += 1
-                
-                # Log progress for large lists
-                if symbol_count % 50 == 0:
-                    logger.info(f"Processed {symbol_count} symbols...")
                     
             except Exception as e:
                 logger.warning(f"Failed to process symbol {symbol}: {e}")
                 continue
         
-        logger.info(f"Total {symbol_count} F&O symbols configured for background processing")
+        logger.info(f"Monitoring {symbol_count} F&O symbols on every {self.refresh_interval}s interval")
         return symbols
     
     def _get_latest_expiry(self, symbol: str, instrument_key: str) -> Optional[str]:
-        """Get the latest (nearest) expiry date for a symbol with caching and aggressive rate limiting"""
-        # Check cache first (expiry dates don't change frequently)
+        """Get the latest (nearest) expiry date for a symbol - OPTIMIZED: Daily cache"""
+        # Check cache first - Valid for entire trading day (until market close)
         cache_key = f"{symbol}_{instrument_key}"
         if cache_key in self.expiry_cache:
             cached_expiry, cache_time = self.expiry_cache[cache_key]
-            # Cache valid for 1 hour (3600 seconds)
-            if time.time() - cache_time < 3600:
-                logger.debug(f"Using cached expiry for {symbol}: {cached_expiry}")
+            # Cache valid until market close (expires at 3:30 PM IST)
+            now = datetime.now(IST)
+            cache_datetime = datetime.fromtimestamp(cache_time, IST)
+            
+            # If cached today and before market close, use it
+            if cache_datetime.date() == now.date() and now.time() < datetime.strptime("15:30", "%H:%M").time():
+                logger.debug(f"Using daily cached expiry for {symbol}: {cached_expiry}")
                 return cached_expiry
         
         # If not in cache or expired, fetch from API
         # Upstox allows: 50/sec, 500/min, 2000/30min for standard APIs
-        max_retries = 2
-        retry_delay = 5  # 5 seconds delay on retry
+        # REAL-TIME OPTIMIZATION: Reduced retries and delays
+        max_retries = 2  # Reduced from 3
+        base_delay = 0.1  # Reduced from 0.4s
         
         for attempt in range(max_retries):
             try:
-                # Small delay to respect rate limits (50/sec = 0.02s per request, we use 0.2s for safety)
-                time.sleep(0.2)  # 200ms delay before each expiry API call
+                # Exponential backoff: 0.5s, 1s, 2s, 4s
+                wait_time = base_delay * (2 ** attempt) if attempt > 0 else base_delay
+                time.sleep(wait_time)  # Delay before each expiry API call
                 
                 contracts_data, error = self.upstox_api.get_option_contracts(instrument_key)
                 
@@ -283,16 +698,16 @@ class OptionChainBackgroundService:
                     for err in errors:
                         if err.get('errorCode') == 'UDAPI10005' or 'Too Many Request' in str(err.get('message', '')):
                             if attempt < max_retries - 1:
-                                wait_time = retry_delay * (2 ** attempt)  # Exponential backoff: 5s, 10s
-                                logger.warning(f"Rate limit getting expiry for {symbol}. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
-                                time.sleep(wait_time)
+                                retry_wait = 5 * (2 ** attempt)  # Exponential backoff: 5s, 10s, 20s
+                                logger.warning(f"⚠️  RATE LIMIT for {symbol}. Waiting {retry_wait}s before retry {attempt + 1}/{max_retries}...")
+                                time.sleep(retry_wait)
                                 continue
                             else:
-                                logger.error(f"Max retries reached getting expiry for {symbol} due to rate limiting. Using cached if available.")
+                                logger.error(f"❌ Max retries reached for {symbol}. Using cached expiry if available.")
                                 # Try to return cached value even if expired
                                 if cache_key in self.expiry_cache:
                                     cached_expiry, _ = self.expiry_cache[cache_key]
-                                    logger.info(f"Using expired cache for {symbol}: {cached_expiry}")
+                                    logger.info(f"✓ Using expired cache for {symbol}: {cached_expiry}")
                                     return cached_expiry
                                 return None
                 
@@ -315,7 +730,7 @@ class OptionChainBackgroundService:
                 # If error and not rate limit, log and retry
                 if error and attempt < max_retries - 1:
                     logger.warning(f"Error getting expiry for {symbol} (attempt {attempt + 1}/{max_retries}): {error}")
-                    time.sleep(retry_delay)
+                    time.sleep(wait_time)
                     continue
                 else:
                     logger.error(f"Failed to get expiry for {symbol}: {error}")
@@ -324,7 +739,7 @@ class OptionChainBackgroundService:
             except Exception as e:
                 if attempt < max_retries - 1:
                     logger.warning(f"Exception getting expiry for {symbol} (attempt {attempt + 1}/{max_retries}): {e}")
-                    time.sleep(retry_delay)
+                    time.sleep(wait_time)
                     continue
                 else:
                     logger.error(f"Failed to get expiry for {symbol}: {e}")
@@ -346,36 +761,74 @@ class OptionChainBackgroundService:
             True if successful, False otherwise
         """
         try:
-            # Small delay to respect rate limits (50/sec = 0.02s per request, we use 0.2s for safety)
-            time.sleep(0.2)  # 200ms delay before option chain API call
+            # Minimal delay - rate limits allow 50/sec, we're doing ~7/sec (215 symbols / 30 sec)
+            time.sleep(0.1)  # 100ms delay (optimized for real-time)
             
-            # Fetch option chain data
-            option_data, error = self.upstox_api.get_pc_option_chain(instrument_key, expiry_date)
+            # Fetch option chain data with retry on network errors
+            max_retries = 3
+            retry_delay = 5
             
-            if not option_data or error is not None:
-                # Check if it's a rate limit error
-                if error and isinstance(error, dict):
-                    errors = error.get('errors', [])
-                    for err in errors:
-                        if err.get('errorCode') == 'UDAPI10005' or 'Too Many Request' in str(err.get('message', '')):
-                            logger.warning(f"Rate limit fetching option chain for {symbol}. Will skip and retry later.")
-                            return False
-                logger.warning(f"Failed to fetch data for {symbol}: {error}")
-                return False
+            for attempt in range(max_retries):
+                try:
+                    option_data, error = self.upstox_api.get_pc_option_chain(instrument_key, expiry_date)
+                    
+                    if not option_data or error is not None:
+                        # Check if it's a rate limit error
+                        if error and isinstance(error, dict):
+                            errors = error.get('errors', [])
+                            for err in errors:
+                                if err.get('errorCode') == 'UDAPI10005' or 'Too Many Request' in str(err.get('message', '')):
+                                    logger.warning(f"Rate limit fetching option chain for {symbol}. Will skip and retry later.")
+                                    return False
+                        
+                        # Check if network error and retry
+                        error_str = str(error)
+                        is_network_error = any(keyword in error_str.lower() for keyword in 
+                            ['connection', 'timeout', 'network', 'unreachable', 'resolve', 'dns'])
+                        
+                        if is_network_error and attempt < max_retries - 1:
+                            logger.warning(f"Network error for {symbol} (attempt {attempt+1}/{max_retries}): {error}. Retrying in {retry_delay}s...")
+                            time.sleep(retry_delay)
+                            continue
+                        
+                        logger.warning(f"Failed to fetch data for {symbol}: {error}")
+                        return False
+                    
+                    # Success - break retry loop
+                    break
+                    
+                except Exception as api_error:
+                    error_str = str(api_error)
+                    is_network_error = any(keyword in error_str.lower() for keyword in 
+                        ['connection', 'timeout', 'network', 'unreachable', 'resolve', 'dns'])
+                    
+                    if is_network_error and attempt < max_retries - 1:
+                        logger.warning(f"Network exception for {symbol} (attempt {attempt+1}/{max_retries}): {api_error}. Retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise
             
             if 'data' not in option_data or not option_data['data']:
                 logger.warning(f"No data returned for {symbol}")
                 return False
             
-            # Extract spot price from API response
+            # Extract spot price from API response or WebSocket (for indices)
             spot_price = 0
-            # Try to get spot price from response (could be at top level or in first strike)
-            if 'underlying_spot_price' in option_data:
-                spot_price = float(option_data.get('underlying_spot_price', 0))
-            elif option_data['data'] and len(option_data['data']) > 0:
-                first_strike = option_data['data'][0]
-                # Try to get spot from strike data
-                spot_price = first_strike.get('underlying_spot_price', 0) or first_strike.get('strike_price', 0)
+            
+            # Try real-time price first for indices (from WebSocket)
+            realtime_price = self._get_realtime_spot_price(symbol, instrument_key)
+            if realtime_price:
+                spot_price = realtime_price
+                logger.debug(f"⚡ Using real-time WebSocket price for {symbol}: {spot_price}")
+            else:
+                # Fall back to API response
+                if 'underlying_spot_price' in option_data:
+                    spot_price = float(option_data.get('underlying_spot_price', 0))
+                elif option_data['data'] and len(option_data['data']) > 0:
+                    first_strike = option_data['data'][0]
+                    # Try to get spot from strike data
+                    spot_price = first_strike.get('underlying_spot_price', 0) or first_strike.get('strike_price', 0)
             
             # If still 0, try to infer from strikes (use middle strike as approximation)
             if spot_price == 0 and option_data['data']:
@@ -395,9 +848,24 @@ class OptionChainBackgroundService:
             
             if success:
                 logger.info(f"Successfully stored raw option chain data for {symbol} ({expiry_date})")
-                # Note: Sentiment calculation is done ONLY in Option Chain Analysis (optionchain.py)
-                # When user views a symbol in Option Chain Analysis, it calculates sentiment and stores it
-                # This ensures single source of truth for sentiment calculation
+                
+                # Calculate and store ITM bucket summaries (1-5 strikes)
+                try:
+                    self._calculate_and_store_itm_buckets(symbol, expiry_date, option_data['data'], spot_price)
+                except Exception as e:
+                    logger.warning(f"Failed to calculate ITM buckets for {symbol}: {e}")
+                
+                # Calculate and store sentiment (for Sentiment Dashboard)
+                try:
+                    self._calculate_and_store_sentiment(symbol, expiry_date, option_data['data'], spot_price)
+                except Exception as e:
+                    logger.warning(f"Failed to calculate sentiment for {symbol}: {e}")
+                
+                # Calculate and store gamma exposure (for gamma leading indicators)
+                try:
+                    self._calculate_and_store_gamma_exposure(symbol, expiry_date, option_data['data'], spot_price)
+                except Exception as e:
+                    logger.warning(f"Failed to calculate gamma exposure for {symbol}: {e}")
             else:
                 logger.warning(f"Failed to store data for {symbol}")
             
@@ -407,9 +875,732 @@ class OptionChainBackgroundService:
             logger.error(f"Error fetching/storing data for {symbol}: {e}")
             return False
     
+    def _calculate_and_store_sentiment(self, symbol: str, expiry_date: str, option_data: List[Dict], spot_price: float):
+        """
+        Calculate comprehensive sentiment score (same as Option Chain Analysis) and store in database
+        Uses ITM filtering (3 strikes by default) before sentiment calculation
+        
+        Args:
+            symbol: Symbol name
+            expiry_date: Expiry date
+            option_data: Raw option chain data
+            spot_price: Current spot price
+        """
+        try:
+            import pandas as pd
+            
+            # ITM count for sentiment calculation (matches UI default: index=2 means 3 strikes)
+            itm_count = 3
+            
+            # Process option chain data (same as optionchain.py)
+            processed_data = []
+            
+            for strike_data in option_data:
+                if 'call_options' not in strike_data or 'put_options' not in strike_data:
+                    continue
+                
+                strike_price = strike_data.get('strike_price', 0)
+                if strike_price <= 0:
+                    continue
+                
+                call_market = strike_data['call_options'].get('market_data', {})
+                call_greeks = strike_data['call_options'].get('option_greeks', {})
+                put_market = strike_data['put_options'].get('market_data', {})
+                put_greeks = strike_data['put_options'].get('option_greeks', {})
+                
+                ce_oi = call_market.get('oi', 0) or 0
+                ce_volume = call_market.get('volume', 0) or 0
+                ce_ltp = call_market.get('ltp', 0) or 0
+                ce_close = call_market.get('close_price', 0) or 0
+                ce_chgoi = ce_oi - (call_market.get('prev_oi', 0) or 0)
+                ce_change = ce_ltp - ce_close if ce_close > 0 else 0
+                
+                pe_oi = put_market.get('oi', 0) or 0
+                pe_volume = put_market.get('volume', 0) or 0
+                pe_ltp = put_market.get('ltp', 0) or 0
+                pe_close = put_market.get('close_price', 0) or 0
+                pe_chgoi = pe_oi - (put_market.get('prev_oi', 0) or 0)
+                pe_change = pe_ltp - pe_close if pe_close > 0 else 0
+                
+                # Calculate position signals
+                def get_position_signal(ltp, change, chgoi):
+                    if change > 0 and chgoi > 0:
+                        return "Long Build"
+                    elif change > 0 and chgoi < 0:
+                        return "Short Covering"
+                    elif change < 0 and chgoi > 0:
+                        return "Short Buildup"
+                    elif change < 0 and chgoi < 0:
+                        return "Long Unwinding"
+                    else:
+                        return "No Change"
+                
+                processed_data.append({
+                    'Strike': strike_price,
+                    'CE_OI': ce_oi,
+                    'CE_Volume': ce_volume,
+                    'CE_ChgOI': ce_chgoi,
+                    'CE_LTP': ce_ltp,
+                    'CE_Change': ce_change,
+                    'CE_Position': get_position_signal(ce_ltp, ce_change, ce_chgoi),
+                    'PE_OI': pe_oi,
+                    'PE_Volume': pe_volume,
+                    'PE_ChgOI': pe_chgoi,
+                    'PE_LTP': pe_ltp,
+                    'PE_Change': pe_change,
+                    'PE_Position': get_position_signal(pe_ltp, pe_change, pe_chgoi),
+                })
+            
+            if not processed_data:
+                return
+            
+            df = pd.DataFrame(processed_data)
+            df = df[df['Strike'] > 0].sort_values('Strike').reset_index(drop=True)
+            
+            if df.empty or len(df) < 3:
+                return
+            
+            # APPLY ITM FILTERING (using delta-based ATM for accuracy)
+            # Delta-based ATM: CE delta closest to 0.5 (more accurate than strike-based)
+            atm_strike = df.loc[df["ce_delta"].sub(0.5).abs().idxmin(), "Strike"]
+            
+            below_atm = df[df["Strike"] < atm_strike].tail(itm_count)
+            above_atm = df[df["Strike"] > atm_strike].head(itm_count)
+            atm_row = df[df["Strike"] == atm_strike]
+            
+            # Combine filtered tables
+            filtered_parts = []
+            if not below_atm.empty:
+                filtered_parts.append(below_atm)
+            if not atm_row.empty:
+                filtered_parts.append(atm_row)
+            if not above_atm.empty:
+                filtered_parts.append(above_atm)
+            
+            if not filtered_parts:
+                return
+            
+            filtered_df = pd.concat(filtered_parts, axis=0, ignore_index=True)
+            filtered_df = filtered_df.sort_values('Strike').reset_index(drop=True)
+            
+            # Calculate PCR data on FILTERED data only
+            ce_oi_total = filtered_df['CE_OI'].sum()
+            pe_oi_total = filtered_df['PE_OI'].sum()
+            ce_chgoi_total = filtered_df['CE_ChgOI'].sum()
+            pe_chgoi_total = filtered_df['PE_ChgOI'].sum()
+            
+            pcr_oi = pe_oi_total / ce_oi_total if ce_oi_total > 0 else 0
+            pcr_chgoi = pe_chgoi_total / ce_chgoi_total if ce_chgoi_total != 0 else 0
+            
+            pcr_data = {
+                'OVERALL_PCR_OI': pcr_oi,
+                'OVERALL_PCR_CHGOI': pcr_chgoi
+            }
+            
+            # COMPREHENSIVE SENTIMENT CALCULATION on FILTERED data (same as Option Chain Analysis)
+            scores = {
+                "price_action": 0,
+                "open_interest": 0,
+                "fresh_activity": 0,
+                "position_distribution": 0
+            }
+            
+            # 1. PRICE ACTION ANALYSIS (25% weight) - using FILTERED data
+            price_score = 0
+            strikes_above_spot = len(filtered_df[filtered_df["Strike"] > spot_price])
+            strikes_below_spot = len(filtered_df[filtered_df["Strike"] < spot_price])
+            
+            if strikes_above_spot > strikes_below_spot:
+                price_score += 20
+            elif strikes_below_spot > strikes_above_spot:
+                price_score -= 20
+            
+            max_pain_strike = filtered_df.loc[filtered_df["CE_OI"].add(filtered_df["PE_OI"]).idxmax(), "Strike"]
+            price_vs_max_pain = (spot_price - max_pain_strike) / max_pain_strike * 100
+            
+            if price_vs_max_pain > 2:
+                price_score -= 30
+            elif price_vs_max_pain < -2:
+                price_score += 30
+            
+            scores["price_action"] = max(-100, min(100, price_score))
+            
+            # 2. OPEN INTEREST ANALYSIS (30% weight) - using FILTERED PCR
+            oi_score = 0
+            if pcr_oi < 0.6:
+                oi_score += 40
+            elif pcr_oi < 0.8:
+                oi_score += 20
+            elif pcr_oi > 1.4:
+                oi_score -= 40
+            elif pcr_oi > 1.2:
+                oi_score -= 20
+            
+            scores["open_interest"] = max(-100, min(100, oi_score))
+            
+            # 3. FRESH ACTIVITY ANALYSIS (25% weight) - using FILTERED PCR ChgOI
+            activity_score = 0
+            if pcr_chgoi > 2.0:
+                activity_score += 50
+            elif pcr_chgoi > 1.5:
+                activity_score += 30
+            elif pcr_chgoi < 0.3:
+                activity_score -= 50
+            elif pcr_chgoi < 0.6:
+                activity_score -= 30
+            
+            scores["fresh_activity"] = max(-100, min(100, activity_score))
+            
+            # 4. POSITION DISTRIBUTION ANALYSIS (20% weight) - using FILTERED positions
+            position_score = 0
+            ce_positions = filtered_df['CE_Position'].value_counts()
+            pe_positions = filtered_df['PE_Position'].value_counts()
+            
+            bullish_ce = ce_positions.get("Long Build", 0) + ce_positions.get("Short Covering", 0)
+            bullish_pe = pe_positions.get("Long Unwinding", 0) + pe_positions.get("Short Buildup", 0)
+            bearish_ce = ce_positions.get("Short Buildup", 0) + ce_positions.get("Long Unwinding", 0)
+            bearish_pe = pe_positions.get("Long Build", 0) + pe_positions.get("Short Covering", 0)
+            
+            total_strikes = len(filtered_df)
+            net_bullish_activity = (bullish_ce - bearish_ce) + (bullish_pe - bearish_pe)
+            position_bias_pct = (net_bullish_activity / total_strikes) * 100
+            position_score = max(-100, min(100, position_bias_pct * 10))
+            
+            scores["position_distribution"] = position_score
+            
+            # Calculate weighted final score
+            weights = {
+                "price_action": 0.25,
+                "open_interest": 0.30,
+                "fresh_activity": 0.25,
+                "position_distribution": 0.20
+            }
+            
+            final_score = sum(scores[key] * weights[key] for key in scores.keys())
+            
+            # Determine sentiment category and confidence
+            if final_score >= 60:
+                sentiment = "STRONG BULLISH"
+                confidence = "HIGH"
+            elif final_score >= 30:
+                sentiment = "BULLISH"
+                confidence = "HIGH"
+            elif final_score >= 15:
+                sentiment = "BULLISH BIAS"
+                confidence = "MEDIUM"
+            elif final_score <= -60:
+                sentiment = "STRONG BEARISH"
+                confidence = "HIGH"
+            elif final_score <= -30:
+                sentiment = "BEARISH"
+                confidence = "HIGH"
+            elif final_score <= -15:
+                sentiment = "BEARISH BIAS"
+                confidence = "MEDIUM"
+            else:
+                sentiment = "NEUTRAL"
+                confidence = "MEDIUM"
+            
+            # Store comprehensive sentiment in database
+            self.db_manager.insert_sentiment_score(
+                symbol=symbol,
+                expiry_date=expiry_date,
+                sentiment_score=final_score,
+                sentiment=sentiment,
+                confidence=confidence,
+                spot_price=spot_price,
+                pcr_oi=pcr_oi,
+                pcr_volume=0  # Not calculated in background service
+            )
+            
+            logger.info(f"Stored comprehensive sentiment for {symbol}: {final_score:.2f} ({sentiment})")
+            
+        except Exception as e:
+            logger.error(f"Error calculating sentiment for {symbol}: {e}")
+    
+    def _calculate_and_store_gamma_exposure(self, symbol: str, expiry_date: str, option_data: List[Dict], spot_price: float):
+        """
+        Calculate gamma exposure and store in database for leading indicators
+        
+        Args:
+            symbol: Symbol name
+            expiry_date: Expiry date
+            option_data: Raw option chain data
+            spot_price: Current spot price
+        """
+        try:
+            import pandas as pd
+            
+            # Process option chain data
+            processed_data = []
+            
+            for strike_data in option_data:
+                if 'call_options' not in strike_data or 'put_options' not in strike_data:
+                    continue
+                
+                strike_price = strike_data.get('strike_price', 0)
+                if strike_price <= 0:
+                    continue
+                
+                call_market = strike_data['call_options'].get('market_data', {})
+                call_greeks = strike_data['call_options'].get('option_greeks', {})
+                put_market = strike_data['put_options'].get('market_data', {})
+                put_greeks = strike_data['put_options'].get('option_greeks', {})
+                
+                ce_oi = call_market.get('oi', 0) or 0
+                pe_oi = put_market.get('oi', 0) or 0
+                ce_gamma = call_greeks.get('gamma', 0) or 0
+                pe_gamma = put_greeks.get('gamma', 0) or 0
+                ce_iv = call_greeks.get('iv', 0) or 0
+                pe_iv = put_greeks.get('iv', 0) or 0
+                ce_delta = call_greeks.get('delta', 0) or 0
+                pe_delta = put_greeks.get('delta', 0) or 0
+                
+                # Calculate GEX (Gamma * OI * Spot^2 / 100)
+                ce_gex = ce_gamma * ce_oi * (spot_price ** 2) / 100 if ce_gamma and ce_oi else 0
+                pe_gex = pe_gamma * pe_oi * (spot_price ** 2) / 100 if pe_gamma and pe_oi else 0
+                net_gex = ce_gex - pe_gex  # Market makers are short options
+                
+                processed_data.append({
+                    'strike': strike_price,
+                    'ce_oi': ce_oi,
+                    'pe_oi': pe_oi,
+                    'ce_gamma': ce_gamma,
+                    'pe_gamma': pe_gamma,
+                    'ce_gex': ce_gex,
+                    'pe_gex': pe_gex,
+                    'net_gex': net_gex,
+                    'ce_iv': ce_iv,
+                    'pe_iv': pe_iv,
+                    'ce_delta': ce_delta,
+                    'pe_delta': pe_delta,
+                })
+            
+            if not processed_data:
+                return
+            
+            df = pd.DataFrame(processed_data)
+            df = df[df['strike'] > 0].sort_values('strike').reset_index(drop=True)
+            
+            if df.empty or len(df) < 3:
+                return
+            
+            # Calculate gamma metrics
+            total_net_gex = df['net_gex'].sum()
+            total_positive_gex = df[df['net_gex'] > 0]['net_gex'].sum()
+            total_negative_gex = df[df['net_gex'] < 0]['net_gex'].sum()
+            
+            atm_idx = df['strike'].sub(spot_price).abs().idxmin()
+            atm_strike = df.loc[atm_idx, 'strike']
+            atm_gamma = df.loc[atm_idx, 'net_gex']
+            
+            # Find zero gamma level (where net GEX crosses zero)
+            zero_gamma_level = spot_price
+            if len(df) > 0:
+                min_gex_idx = df['net_gex'].abs().idxmin()
+                zero_gamma_level = df.loc[min_gex_idx, 'strike']
+            
+            # Calculate gamma concentration (std dev of GEX)
+            gamma_concentration = df['net_gex'].std() if len(df) > 1 else 0
+            
+            # Calculate gamma gradient (change in GEX per strike)
+            gamma_gradient = 0
+            if len(df) > 1:
+                gamma_gradient = (df['net_gex'].iloc[-1] - df['net_gex'].iloc[0]) / len(df)
+            
+            # Calculate IV metrics
+            avg_iv = (df['ce_iv'].mean() + df['pe_iv'].mean()) / 2
+            atm_iv = (df.loc[atm_idx, 'ce_iv'] + df.loc[atm_idx, 'pe_iv']) / 2
+            iv_skew = df['pe_iv'].mean() - df['ce_iv'].mean()
+            
+            # Calculate OI metrics
+            total_oi = df['ce_oi'].sum() + df['pe_oi'].sum()
+            atm_oi = int(df.loc[atm_idx, 'ce_oi'] + df.loc[atm_idx, 'pe_oi'])
+            oi_imbalance = (df['pe_oi'].sum() - df['ce_oi'].sum()) / total_oi if total_oi > 0 else 0
+            
+            # Delta metrics
+            delta_imbalance = (df['pe_delta'].sum() - df['ce_delta'].sum())
+            
+            # FETCH HISTORICAL DATA FOR VELOCITY/ACCELERATION CALCULATIONS
+            # Note: Background service refreshes every 3 minutes, so velocities are per 3-minute interval
+            refresh_interval_minutes = 3  # Data refreshes every 3 minutes
+            
+            # Get previous data point - must be at least 1 minute old to avoid fetching current record
+            prev_data = None
+            # IMPROVED APPROACH: Fetch last 10 insertions and filter for actual data changes
+            # API sometimes returns same data multiple times - we need records where values actually changed
+            is_index = symbol in self.realtime_indices
+            
+            try:
+                with self.db_manager.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        # Get last 10 data points to find records with actual changes
+                        cur.execute("""
+                            SELECT atm_iv, atm_oi, timestamp, gamma_concentration
+                            FROM gamma_exposure_history
+                            WHERE symbol = %s AND expiry_date = %s
+                            ORDER BY timestamp DESC
+                            LIMIT 10
+                        """, (symbol, expiry_date))
+                        all_historical_data = cur.fetchall()
+            except Exception as e:
+                logger.debug(f"No historical data for {symbol}: {e}")
+                all_historical_data = []
+            
+            # Filter for records where OI or IV actually changed (not duplicate API responses)
+            historical_data = []
+            prev_oi = None
+            prev_iv = None
+            
+            for record in all_historical_data:
+                curr_iv = float(record[0]) if record[0] is not None else 0
+                curr_oi = float(record[1]) if record[1] is not None else 0
+                
+                # Include record if it's the first OR if OI/IV changed from previous
+                if prev_oi is None or curr_oi != prev_oi or curr_iv != prev_iv:
+                    historical_data.append(record)
+                    prev_oi = curr_oi
+                    prev_iv = curr_iv
+                    
+                    # Stop after finding 3 unique records
+                    if len(historical_data) >= 3:
+                        break
+            
+            # Calculate velocities and accelerations from records with actual changes
+            if len(historical_data) >= 1:
+                # Point 1 (most recent DIFFERENT data in DB)
+                p1_iv, p1_oi, p1_time, p1_gamma = historical_data[0]
+                p1_iv = float(p1_iv) if p1_iv is not None else 0
+                p1_oi = float(p1_oi) if p1_oi is not None else 0
+                p1_gamma = float(p1_gamma) if p1_gamma is not None else 0
+                
+                # Check if current data is different from most recent DB record
+                has_changed = (atm_oi != p1_oi or atm_iv != p1_iv)
+                
+                if has_changed:
+                    # Time difference between current (point 0) and previous (point 1)
+                    # Use actual data fetch timestamp for consistency
+                    current_timestamp = datetime.now(IST)  # When this data was fetched
+                    time_diff_seconds = (current_timestamp - p1_time).total_seconds()
+                    time_divisor = time_diff_seconds if is_index else time_diff_seconds / 60
+                    
+                    # Define caps based on symbol type (used in multiple places)
+                    iv_cap = 0.16 if is_index else 10
+                    oi_cap = 1666 if is_index else 100000
+                    accel_cap = 166 if is_index else 10000
+                    
+                    # VELOCITY calculation: (current - previous) / time_diff
+                    # IV velocity
+                    if p1_iv > 0 and atm_iv != p1_iv:
+                        iv_velocity = (atm_iv - p1_iv) / time_divisor
+                        # Cap: -10%/+10% per min for stocks, -0.16%/+0.16% per sec for indices
+                        iv_velocity = max(-iv_cap, min(iv_cap, iv_velocity))
+                    else:
+                        iv_velocity = 0
+                    
+                    # OI velocity
+                    if atm_oi != p1_oi:
+                        oi_velocity = (atm_oi - p1_oi) / time_divisor
+                        # Cap: +/- 100,000 per min for stocks, +/- 1,666 per sec for indices
+                        oi_velocity = max(-oi_cap, min(oi_cap, oi_velocity))
+                    else:
+                        oi_velocity = 0
+                    
+                    # ACCELERATION calculation: need 2 different historical points
+                    if len(historical_data) >= 2:
+                        # Point 2 (second most recent DIFFERENT data in DB)
+                        p2_oi, p2_time = historical_data[1][1], historical_data[1][2]
+                        p2_oi = float(p2_oi) if p2_oi is not None else 0
+                        
+                        # Time difference between point 1 and point 2
+                        prev_time_diff_seconds = (p1_time - p2_time).total_seconds()
+                        prev_time_divisor = prev_time_diff_seconds if is_index else prev_time_diff_seconds / 60
+                        
+                        # Previous velocity: (point1 - point2) / time_diff
+                        if p1_oi != p2_oi and prev_time_divisor > 0:
+                            prev_oi_velocity = (p1_oi - p2_oi) / prev_time_divisor
+                            prev_oi_velocity = max(-oi_cap, min(oi_cap, prev_oi_velocity))
+                            
+                            # Acceleration: (current_velocity - previous_velocity) / time_diff
+                            oi_acceleration = (oi_velocity - prev_oi_velocity) / time_divisor
+                            # Cap: +/- 10,000/min² for stocks, +/- 166/sec² for indices
+                            oi_acceleration = max(-accel_cap, min(accel_cap, oi_acceleration))
+                        else:
+                            oi_acceleration = 0
+                    else:
+                        # Only 1 previous different point - can't calculate acceleration
+                        oi_acceleration = 0
+                    
+                    # UNWINDING INTENSITY calculation (percentage of starting OI being closed per hour)
+                    # Unwinding = positions closing (negative OI change)
+                    # Calculate as: (change / starting_OI) * 100, then annualize to per-hour rate
+                    starting_oi = p1_oi  # OI at previous timestamp
+                    oi_change = atm_oi - starting_oi
+                    
+                    if starting_oi > 0 and oi_change < 0:
+                        # What % of previous OI has been closed?
+                        unwinding_pct = abs(oi_change / starting_oi) * 100
+                        # Standardize to per-hour rate for comparability
+                        time_hours = time_diff_seconds / 3600
+                        unwinding_intensity = (unwinding_pct / time_hours) if time_hours > 0 else 0
+                        unwinding_intensity = min(100, unwinding_intensity)  # Cap at 100%/hour
+                        
+                        if is_index:
+                            logger.info(f"   Unwinding: {oi_change:.0f} contracts ({unwinding_pct:.2f}% of {starting_oi:.0f}) in {time_diff_seconds:.0f}s = {unwinding_intensity:.2f}%/hour")
+                    else:
+                        unwinding_intensity = 0
+                    
+                    # Other metrics
+                    gamma_conc_trend = (gamma_concentration - p1_gamma) / time_divisor if p1_gamma and gamma_concentration != p1_gamma else 0
+                    iv_trend = 1 if atm_iv > p1_iv else -1 if atm_iv < p1_iv else 0
+                    total_oi_change_rate = oi_velocity / total_oi if total_oi > 0 else 0
+                    
+                    # DEBUG: Log velocity calculations for indices
+                    if is_index and (oi_velocity != 0 or iv_velocity != 0):
+                        logger.info(f"🔍 {symbol} VELOCITY: IV={iv_velocity:.4f}%/sec, OI={oi_velocity:.2f}/sec, Accel={oi_acceleration:.2f}, Unwinding={unwinding_intensity:.2f}%")
+                        logger.info(f"   Current: IV={atm_iv:.2f}, OI={atm_oi}, Previous: IV={p1_iv:.2f}, OI={p1_oi}, Time diff={time_diff_seconds:.1f}s")
+                else:
+                    # Current data same as last DB record - no change from API
+                    logger.info(f"{symbol}: ⚠️ No change from previous record - Current OI={atm_oi}, IV={atm_iv:.2f} | Previous OI={p1_oi}, IV={p1_iv:.2f}")
+                    iv_velocity = oi_velocity = oi_acceleration = 0
+                    unwinding_intensity = 0
+                    gamma_conc_trend = iv_trend = total_oi_change_rate = 0
+                
+            else:
+                # First data point - no historical comparison
+                logger.info(f"{symbol}: No historical data - first insertion")
+                iv_velocity = oi_velocity = oi_acceleration = 0
+                unwinding_intensity = 0
+                gamma_conc_trend = iv_trend = total_oi_change_rate = 0
+            
+            # Calculate IV percentile (position in range)
+            iv_values = list(df['ce_iv']) + list(df['pe_iv'])
+            iv_values = [v for v in iv_values if v > 0]
+            if iv_values and len(iv_values) > 1:
+                iv_percentile = sum(1 for v in iv_values if v <= atm_iv) / len(iv_values)
+            else:
+                iv_percentile = 0.5
+            
+            # ==================================================================
+            # ADAPTIVE GAMMA BLAST DETECTION WITH STATISTICAL THRESHOLDS
+            # ==================================================================
+            
+            # Fetch historical data for adaptive z-score calculation (last 20 periods)
+            try:
+                with self.db_manager.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT atm_iv, atm_oi, gamma_concentration, net_gex
+                            FROM gamma_exposure_history
+                            WHERE symbol = %s AND expiry_date = %s
+                            ORDER BY timestamp DESC
+                            LIMIT 20
+                        """, (symbol, expiry_date))
+                        
+                        historical_rows = cur.fetchall()
+                        historical_data = [
+                            {
+                                'atm_iv': float(row[0]) if row[0] else 0,
+                                'atm_oi': float(row[1]) if row[1] else 0,
+                                'gamma_concentration': float(row[2]) if row[2] else 0,
+                                'net_gex': float(row[3]) if row[3] else 0
+                            }
+                            for row in historical_rows
+                        ]
+            except Exception as hist_err:
+                logger.debug(f"Could not fetch historical data for {symbol}: {hist_err}")
+                historical_data = []
+            
+            # Calculate average IVs for skew
+            call_ivs = [iv for iv in df['ce_iv'] if iv > 0]
+            put_ivs = [iv for iv in df['pe_iv'] if iv > 0]
+            ce_iv_avg = sum(call_ivs) / len(call_ivs) if call_ivs else 0
+            pe_iv_avg = sum(put_ivs) / len(put_ivs) if put_ivs else 0
+            
+            # Prepare current data for detector
+            current_data = {
+                'atm_iv': atm_iv,
+                'atm_oi': atm_oi,
+                'gamma_concentration': gamma_concentration,
+                'net_gex': total_net_gex,
+                'spot_price': spot_price,
+                'atm_strike': atm_strike,
+                'ce_oi_total': df['ce_oi'].sum() if 'ce_oi' in df.columns else 0,
+                'pe_oi_total': df['pe_oi'].sum() if 'pe_oi' in df.columns else 0,
+                'ce_iv_avg': ce_iv_avg,
+                'pe_iv_avg': pe_iv_avg
+            }
+            
+            # Use adaptive detector (handles insufficient data gracefully with z-score=0)
+            blast_signal = self.gamma_detector.detect_gamma_blast(
+                symbol=symbol,
+                current_data=current_data,
+                historical_data=historical_data
+            )
+            
+            gamma_blast_probability = blast_signal.probability
+            predicted_direction = blast_signal.direction
+            confidence_level = blast_signal.confidence
+            time_to_blast_minutes = blast_signal.time_to_blast_min
+            
+            # Log adaptive triggers for transparency
+            if blast_signal.triggers:
+                logger.info(f"{symbol} Adaptive Gamma Blast: {gamma_blast_probability:.1%} | "
+                           f"Triggers: {', '.join(blast_signal.triggers)}")
+            elif len(historical_data) < 5:
+                logger.debug(f"{symbol} Insufficient history ({len(historical_data)} periods) - using non-statistical signals only")
+            
+            # ==================================================================
+            
+            # Store gamma exposure history with calculated velocities
+            timestamp = datetime.now(IST)
+            self.db_manager.insert_gamma_exposure_history(
+                symbol=symbol,
+                expiry_date=expiry_date,
+                timestamp=timestamp,
+                atm_strike=atm_strike,
+                net_gex=total_net_gex,
+                total_positive_gex=total_positive_gex,
+                total_negative_gex=total_negative_gex,
+                zero_gamma_level=zero_gamma_level,
+                atm_iv=atm_iv,
+                iv_trend=iv_trend,
+                iv_velocity=iv_velocity,  # Per-second for indices, per-minute for stocks
+                iv_percentile=iv_percentile,
+                implied_move=avg_iv * spot_price / 100,
+                atm_oi=atm_oi,
+                oi_acceleration=oi_acceleration,  # Per-sec² for indices, per-min² for stocks
+                oi_velocity=oi_velocity,  # Per-second for indices, per-minute for stocks
+                total_oi_change_rate=total_oi_change_rate,
+                atm_gamma=atm_gamma,
+                gamma_concentration=gamma_concentration,
+                gamma_gradient=gamma_gradient,
+                delta_skew=iv_skew,
+                delta_ladder_imbalance=delta_imbalance,
+                volatility_regime="NORMAL",
+                regime_transition_score=0,
+                gamma_blast_probability=gamma_blast_probability,
+                time_to_blast_minutes=time_to_blast_minutes,
+                predicted_direction=predicted_direction,
+                confidence_level=confidence_level
+            )
+            
+            logger.info(f"Stored gamma exposure for {symbol}: Prob={gamma_blast_probability:.2%}, Direction={predicted_direction}")
+            
+        except Exception as e:
+            logger.error(f"Error calculating gamma exposure for {symbol}: {e}")
+    
+    def _calculate_and_store_itm_buckets(self, symbol: str, expiry_date: str, option_data: List[Dict], spot_price: float):
+        """
+        Calculate ITM bucket summaries (1-5 strikes) and store in database
+        
+        Args:
+            symbol: Symbol name
+            expiry_date: Expiry date
+            option_data: Raw option chain data
+            spot_price: Current spot price
+        """
+        try:
+            import pandas as pd
+            
+            # Process option chain data into DataFrame
+            processed_data = []
+            
+            for strike_data in option_data:
+                if 'call_options' not in strike_data or 'put_options' not in strike_data:
+                    continue
+                
+                strike_price = strike_data.get('strike_price', 0)
+                if strike_price <= 0:
+                    continue
+                
+                # Call options
+                call_market = strike_data['call_options'].get('market_data', {})
+                call_greeks = strike_data['call_options'].get('option_greeks', {})
+                
+                # Put options
+                put_market = strike_data['put_options'].get('market_data', {})
+                put_greeks = strike_data['put_options'].get('option_greeks', {})
+                
+                processed_data.append({
+                    'strike': strike_price,
+                    'ce_oi': call_market.get('oi', 0) or 0,
+                    'ce_vol': call_market.get('volume', 0) or 0,
+                    'ce_chgoi': (call_market.get('oi', 0) or 0) - (call_market.get('prev_oi', 0) or 0),
+                    'ce_iv': call_greeks.get('iv', 0) or 0,
+                    'ce_delta': call_greeks.get('delta', 0) or 0,
+                    'pe_oi': put_market.get('oi', 0) or 0,
+                    'pe_vol': put_market.get('volume', 0) or 0,
+                    'pe_chgoi': (put_market.get('oi', 0) or 0) - (put_market.get('prev_oi', 0) or 0),
+                    'pe_iv': put_greeks.get('iv', 0) or 0,
+                    'pe_delta': put_greeks.get('delta', 0) or 0,
+                })
+            
+            if not processed_data:
+                return
+            
+            df = pd.DataFrame(processed_data)
+            df = df[df['strike'] > 0].sort_values('strike').reset_index(drop=True)
+            
+            if df.empty:
+                return
+            
+            # Find ATM strike
+            atm_strike = df.loc[df['strike'].sub(spot_price).abs().idxmin(), 'strike']
+            
+            # Calculate ITM buckets for 1-5 strikes
+            timestamp = datetime.now(IST)
+            
+            for itm_count in range(1, 6):
+                # ITM Calls: below ATM (lower strikes)
+                itm_calls = df[df['strike'] < atm_strike].tail(itm_count)
+                
+                # ITM Puts: above ATM (higher strikes)
+                itm_puts = df[df['strike'] > atm_strike].head(itm_count)
+                
+                # Aggregate
+                ce_oi = int(itm_calls['ce_oi'].sum()) if not itm_calls.empty else 0
+                pe_oi = int(itm_puts['pe_oi'].sum()) if not itm_puts.empty else 0
+                ce_vol = int(itm_calls['ce_vol'].sum()) if not itm_calls.empty else 0
+                pe_vol = int(itm_puts['pe_vol'].sum()) if not itm_puts.empty else 0
+                ce_chgoi = int(itm_calls['ce_chgoi'].sum()) if not itm_calls.empty else 0
+                pe_chgoi = int(itm_puts['pe_chgoi'].sum()) if not itm_puts.empty else 0
+                
+                # Weighted IV and Delta
+                ce_iv = (itm_calls['ce_iv'] * itm_calls['ce_oi']).sum() / ce_oi if ce_oi > 0 else 0
+                ce_delta = (itm_calls['ce_delta'] * itm_calls['ce_oi']).sum() / ce_oi if ce_oi > 0 else 0
+                pe_iv = (itm_puts['pe_iv'] * itm_puts['pe_oi']).sum() / pe_oi if pe_oi > 0 else 0
+                pe_delta = (itm_puts['pe_delta'] * itm_puts['pe_oi']).sum() / pe_oi if pe_oi > 0 else 0
+                
+                # Insert into database
+                self.db_manager.insert_itm_bucket_summary(
+                    symbol=symbol,
+                    expiry_date=expiry_date,
+                    timestamp=timestamp,
+                    itm_count=itm_count,
+                    spot_price=spot_price,
+                    atm_strike=atm_strike,
+                    ce_oi=ce_oi,
+                    ce_volume=ce_vol,
+                    ce_chgoi=ce_chgoi,
+                    ce_iv=ce_iv,
+                    ce_delta=ce_delta,
+                    pe_oi=pe_oi,
+                    pe_volume=pe_vol,
+                    pe_chgoi=pe_chgoi,
+                    pe_iv=pe_iv,
+                    pe_delta=pe_delta
+                )
+            
+            logger.debug(f"Successfully calculated and stored ITM buckets for {symbol}")
+            
+        except Exception as e:
+            logger.error(f"Error calculating ITM buckets for {symbol}: {e}", exc_info=True)
+    
     def _process_symbol(self, symbol_config: Dict) -> bool:
         """
         Process a single symbol: get expiry and fetch data
+        OPTIMIZED: Uses cached expiry to reduce API calls dramatically
         
         Args:
             symbol_config: Symbol configuration dictionary
@@ -421,8 +1612,44 @@ class OptionChainBackgroundService:
         instrument_key = symbol_config['instrument_key']
         
         try:
-            # Get latest expiry
-            expiry_date = self._get_latest_expiry(symbol, instrument_key)
+            # OPTIMIZATION: Try to get expiry from cache first or database
+            # Only call API if truly necessary (max once per hour per symbol)
+            cache_key = f"{symbol}_{instrument_key}"
+            
+            expiry_date = None
+            
+            # Check if we have cached expiry (valid for 1 hour)
+            if cache_key in self.expiry_cache:
+                cached_expiry, cache_time = self.expiry_cache[cache_key]
+                if time.time() - cache_time < 3600:  # 1 hour cache
+                    expiry_date = cached_expiry
+                    logger.debug(f"Using cached expiry for {symbol}: {expiry_date}")
+            
+            # If no valid cache, try to get from database (from previous run)
+            if not expiry_date and self.db_manager:
+                try:
+                    with self.db_manager.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""
+                                SELECT DISTINCT expiry_date 
+                                FROM option_chain_data 
+                                WHERE symbol = %s
+                                ORDER BY expiry_date ASC
+                                LIMIT 1
+                            """, (symbol,))
+                            result = cur.fetchone()
+                            if result and result[0]:
+                                expiry_date = str(result[0])
+                                # Cache it
+                                self.expiry_cache[cache_key] = (expiry_date, time.time())
+                                logger.debug(f"Using DB expiry for {symbol}: {expiry_date}")
+                except:
+                    pass  # Continue to API call
+            
+            # Only call API to get expiry if we have no cached or DB value
+            if not expiry_date:
+                logger.debug(f"Fetching expiry from API for {symbol}")
+                expiry_date = self._get_latest_expiry(symbol, instrument_key)
             
             if not expiry_date:
                 logger.warning(f"No expiry found for {symbol}")
@@ -436,7 +1663,7 @@ class OptionChainBackgroundService:
             return False
     
     def _fetch_all_symbols(self):
-        """Fetch data for all active symbols - Only during market hours"""
+        """Fetch data for all active symbols - OPTIMIZED FOR REAL-TIME"""
         # Check if market is open (unless force_run is enabled for testing)
         if not self.force_run and not self._is_market_open():
             logger.info("Market is closed. Skipping data fetch. UI will show last fetched data from database.")
@@ -448,39 +1675,47 @@ class OptionChainBackgroundService:
             logger.warning("No active symbols to process")
             return
         
-        logger.info(f"Fetching data for {len(symbols)} symbols...")
+        # Filter out indices from main loop (they're handled by fast refresh thread)
+        symbols = [s for s in symbols if s['symbol'] not in self.realtime_indices]
         
-        # Process symbols in small batches to optimize rate limit usage
-        # Upstox allows: 50/sec, 500/min, 2000/30min for standard APIs
-        # Each symbol needs: 1 expiry call + 1 option chain call = 2 API calls
-        # We can safely process 10 symbols in parallel (20 API calls) with small delays
-        batch_size = 10  # Process 10 symbols at a time
-        delay_between_batches = 1  # 1 second delay between batches
-        delay_between_requests = 0.1  # 100ms delay between individual requests
-        delay_on_rate_limit = 10  # 10 seconds wait if rate limited
+        if not symbols:
+            logger.info("No stock symbols to process (indices handled by fast refresh)")
+            return
+        
+        logger.info(f"📡 Fetching {len(symbols)} stock symbols via REST API (3-min cycle)...")
+        if self.use_websocket:
+            logger.info(f"⚡ {len(self.realtime_indices)} indices updating every {self.index_refresh_interval}s via fast refresh thread")
+        
+        # HYBRID OPTIMIZATION:
+        # - Indices: Fast refresh thread (90-second updates)
+        # - Stocks: REST API every 3 minutes (~210 symbols)
+        # - Rate limit friendly: ~1.2 calls/sec average
+        
+        batch_size = 43  # ~210 / 5 workers = ~42 per batch
+        delay_between_batches = 0.5  # 500ms delay between batches
+        delay_on_rate_limit = 30  # 30 seconds wait if rate limited
         
         success_count = 0
         total_symbols = len([s for s in symbols if s.get('is_active', True)])
         rate_limit_hit = False
         
-        # Process symbols in batches
+        start_time = time.time()
+        
+        # Process symbols in batches with parallel workers
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i:i + batch_size]
             batch_futures = {}
             
             # If rate limit was hit previously, wait before processing batch
             if rate_limit_hit:
-                logger.warning(f"Rate limit was hit. Waiting {delay_on_rate_limit} seconds before next batch...")
+                logger.warning(f"⏸️  Waiting {delay_on_rate_limit}s due to rate limit...")
                 time.sleep(delay_on_rate_limit)
                 rate_limit_hit = False
             
-            # Submit batch with small delays
+            # Submit entire batch to thread pool (5 workers process in parallel)
             for symbol_config in batch:
                 if not symbol_config.get('is_active', True):
                     continue
-                
-                # Small delay before each request
-                time.sleep(delay_between_requests)
                 
                 future = self.executor.submit(self._process_symbol, symbol_config)
                 batch_futures[future] = symbol_config['symbol']
@@ -496,15 +1731,66 @@ class OptionChainBackgroundService:
                     error_str = str(e)
                     if 'UDAPI10005' in error_str or 'Too Many Request' in error_str or 'rate limit' in error_str.lower():
                         rate_limit_hit = True
-                        logger.warning(f"Rate limit detected for {symbol}")
+                        logger.warning(f"⚠️  Rate limit hit on {symbol}")
                     else:
-                        logger.error(f"Exception processing {symbol}: {e}")
+                        logger.debug(f"Exception processing {symbol}: {e}")
             
-            # Delay between batches
+            # Small delay between batches
             if i + batch_size < len(symbols):
                 time.sleep(delay_between_batches)
         
-        logger.info(f"Completed fetching: {success_count}/{total_symbols} symbols successful")
+        elapsed = time.time() - start_time
+        logger.info(f"✅ Completed in {elapsed:.1f}s: {success_count}/{total_symbols} symbols successful")
+        logger.info(f"📊 Processing rate: {success_count/elapsed:.1f} symbols/sec")
+    
+    def _fast_index_refresh_loop(self):
+        """Fast refresh loop for indices (90-second updates)"""
+        logger.info("⚡ Index fast-refresh thread started")
+        last_refresh = 0
+        
+        while self.running:
+            try:
+                now = time.time()
+                
+                # Check if it's time to refresh (every 30 seconds)
+                if now - last_refresh >= self.index_refresh_interval:
+                    # Check market status
+                    if not self.force_run and not self._is_market_open():
+                        logger.debug("Market closed, skipping index refresh")
+                        time.sleep(60)
+                        continue
+                    
+                    # Get index symbols
+                    all_symbols = self._get_active_symbols()
+                    index_symbols = [s for s in all_symbols if s['symbol'] in self.realtime_indices]
+                    
+                    if index_symbols:
+                        logger.debug(f"⚡ Refreshing {len(index_symbols)} indices...")
+                        success_count = 0
+                        
+                        # Process indices one by one with delay to avoid rate limits
+                        for idx, symbol_config in enumerate(index_symbols):
+                            try:
+                                if self._process_symbol(symbol_config):
+                                    success_count += 1
+                                # Add delay between indices to avoid rate limits (3s each = 15s total for 5 indices)
+                                if idx < len(index_symbols) - 1:
+                                    time.sleep(3.0)
+                            except Exception as e:
+                                logger.debug(f"Error refreshing {symbol_config['symbol']}: {e}")
+                        
+                        logger.info(f"⚡ Indices updated: {success_count}/{len(index_symbols)} successful")
+                    
+                    last_refresh = now
+                
+                # Sleep briefly to avoid busy-waiting
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error in index fast-refresh loop: {e}")
+                time.sleep(5)
+        
+        logger.info("⚡ Index fast-refresh thread stopped")
     
     def start(self):
         """Start the background service - Only fetches during market hours"""
@@ -513,29 +1799,94 @@ class OptionChainBackgroundService:
             return
         
         self.running = True
-        logger.info("Starting Option Chain Background Service...")
-        logger.info("Market hours: 9:15 AM - 3:30 PM IST (Monday-Friday)")
-        logger.info(f"Refresh interval: {self.refresh_interval} seconds (when market is open)")
-        logger.info("Rate limiting: Batch processing (10 symbols), optimized for Upstox limits (50/sec, 500/min)")
-        logger.info("Expiry caching: Enabled (1 hour cache) - reduces API calls significantly")
-        logger.info("WebSocket: Disabled (using REST API only)")
+        logger.info("🚀 Starting Option Chain Background Service - HYBRID MODE")
+        logger.info("=" * 70)
+        
+        if self.use_websocket and self.websocket_manager:
+            logger.info("⚡ REAL-TIME: Indices (WebSocket streaming)")
+            logger.info(f"   • {', '.join(self.realtime_indices)}")
+            logger.info("   • Update latency: < 1 second")
+        else:
+            logger.info(f"⚡ FAST REFRESH: Indices (REST API)")
+            logger.info(f"   • {', '.join(self.realtime_indices)}")
+            logger.info(f"   • Refresh interval: {self.index_refresh_interval} seconds")
+        logger.info("")
+        
+        logger.info(f"📊 PERIODIC: All stocks (REST API)")
+        logger.info(f"   • Refresh interval: {self.refresh_interval} seconds (3 minutes)")
+        logger.info("   • Symbols: 215 F&O stocks")
+        logger.info("   • Workers: 5 parallel threads")
+        logger.info("")
+        logger.info("💾 Expiry cache: Daily (reset at market close)")
+        logger.info("🕐 Market hours: 9:15 AM - 3:30 PM IST (Monday-Friday)")
+        logger.info("=" * 70)
+        
+        # Start separate thread for fast index refresh
+        if not self.use_websocket:
+            index_thread = threading.Thread(target=self._fast_index_refresh_loop, daemon=True)
+            index_thread.start()
+            logger.info("⚡ Started fast refresh thread for indices (90-second updates)")
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 10  # Allow 10 consecutive errors before stopping
         
         try:
             while self.running:
                 start_time = time.time()
                 
-                # Check market status
-                if not self.force_run and not self._is_market_open():
-                    # Market is closed - wait and check again
-                    now = datetime.now(IST)
-                    logger.info(f"Market is closed (Current time: {now.strftime('%Y-%m-%d %H:%M:%S IST')}). Waiting 60 seconds before checking again...")
-                    logger.info("UI will continue to show last fetched data from database.")
-                    time.sleep(60)  # Check every minute when market is closed
-                    continue
-                
-                # Market is open - fetch data
-                logger.info("Market is open. Fetching data for all symbols...")
-                self._fetch_all_symbols()
+                try:
+                    # Check market status
+                    if not self.force_run and not self._is_market_open():
+                        # Market is closed - wait and check again
+                        now = datetime.now(IST)
+                        current_time = now.time()
+                        market_close = datetime.strptime("15:30", "%H:%M").time()
+                        
+                        # If it's after 3:30 PM, stop the service until next market open
+                        if current_time > market_close:
+                            logger.info(f"Market closed at 3:30 PM. Current time: {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
+                            logger.info("Background service will stop fetching data. Dashboard will display data until 3:30 PM.")
+                            logger.info("Restart the service tomorrow during market hours (9:15 AM - 3:30 PM).")
+                            self.stop()
+                            break
+                        else:
+                            logger.info(f"Market not yet open (Current time: {now.strftime('%Y-%m-%d %H:%M:%S IST')}). Waiting 60 seconds...")
+                            logger.info("Market hours: 9:15 AM - 3:30 PM IST (Monday-Friday)")
+                            time.sleep(60)  # Check every minute when market is closed
+                        continue
+                    
+                    # Market is open - fetch data
+                    logger.info("Market is open. Fetching data for all symbols...")
+                    self._fetch_all_symbols()
+                    
+                    # Reset error counter on successful fetch
+                    consecutive_errors = 0
+                    
+                except Exception as fetch_error:
+                    consecutive_errors += 1
+                    error_str = str(fetch_error)
+                    
+                    # Check if it's a network/connection error
+                    is_network_error = any(keyword in error_str.lower() for keyword in 
+                        ['connection', 'timeout', 'network', 'unreachable', 'resolve', 'dns'])
+                    
+                    if is_network_error:
+                        logger.warning(f"Network error detected (attempt {consecutive_errors}/{max_consecutive_errors}): {fetch_error}")
+                        logger.info("Waiting 30 seconds before retry...")
+                        time.sleep(30)
+                    else:
+                        logger.error(f"Error in fetch cycle (attempt {consecutive_errors}/{max_consecutive_errors}): {fetch_error}")
+                        time.sleep(10)
+                    
+                    # Only stop if we've had too many consecutive errors
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping service.")
+                        logger.error("Please check your internet connection and API credentials.")
+                        self.stop()
+                        break
+                    
+                    # Continue to next iteration even after error
+                    logger.info("Continuing to next cycle despite error...")
                 
                 # Calculate sleep time to maintain refresh interval
                 elapsed = time.time() - start_time
@@ -548,7 +1899,7 @@ class OptionChainBackgroundService:
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt")
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}")
+            logger.error(f"Fatal error in main loop: {e}")
         finally:
             self.stop()
     
@@ -583,8 +1934,8 @@ def main():
     parser.add_argument(
         '--interval',
         type=int,
-        default=60,
-        help='Refresh interval in seconds when market is open (default: 60 = 1 minute)'
+        default=180,
+        help='Refresh interval in seconds when market is open (default: 180 = 3 minutes, optimized to avoid rate limiting)'
     )
     parser.add_argument(
         '--force',

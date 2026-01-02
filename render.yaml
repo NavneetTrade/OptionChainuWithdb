@@ -1,0 +1,42 @@
+# Render.com configuration (FREE tier with limitations)
+
+services:
+  # Streamlit Dashboard
+  - type: web
+    name: option-chain-dashboard
+    env: python
+    region: singapore
+    plan: free  # 750 hours/month, sleeps after 15 min
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run optionchain.py --server.port 8502 --server.headless true
+    healthCheckPath: /
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: UPSTOX_API_KEY
+        sync: false
+      - key: UPSTOX_SECRET
+        sync: false
+      - key: TZ
+        value: Asia/Kolkata
+  
+  # Background Data Collection Worker
+  - type: worker
+    name: option-chain-worker
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python background_service.py --force
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: UPSTOX_API_KEY
+        sync: false
+      - key: UPSTOX_SECRET
+        sync: false
+      - key: TZ
+        value: Asia/Kolkata
+
+# Note: Free PostgreSQL database available for 90 days
+# After that, either upgrade to $7/month or use Neon.tech free tier

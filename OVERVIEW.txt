@@ -1,0 +1,85 @@
+╔═══════════════════════════════════════════════════════════════╗
+║   OPTION CHAIN ANALYSIS SYSTEM - CLEAN & OPTIMIZED           ║
+╚═══════════════════════════════════════════════════════════════╝
+
+🎯 WHAT'S INCLUDED:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ CORE SERVICES:
+   • background_service.py - Fetches data for 215+ F&O symbols
+   • dashboard_app.py - Modern Flask dashboard (http://localhost:5000)
+   • database.py - TimescaleDB interface with connection pooling
+   • upstox_api.py - API client with rate limiting protection
+
+✅ START/STOP SCRIPTS:
+   • start_system.sh - One-command startup
+   • stop_system.sh - One-command shutdown
+
+✅ UTILITIES:
+   • clear_database.py - Reset database tables
+   • config.py - System configuration
+
+✅ LEGACY (optional):
+   • optionchain.py - Old Streamlit app (superseded by dashboard)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🚀 QUICK START:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   ./start_system.sh
+
+   Then open: http://localhost:8501
+
+   (Port 8501 avoids macOS AirPlay Receiver conflict)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 FEATURES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   ✓ Real-time sentiment analysis for all F&O symbols
+   ✓ Gamma exposure tracking and blast probability
+   ✓ Modern HTML dashboard with WebSocket updates
+   ✓ Rate limit protection (no more "Too Many Requests")
+   ✓ Optimized database with proper indexes
+   ✓ Auto-refresh every 10 seconds
+   ✓ 24-hour historical charts
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔧 RATE LIMIT PROTECTION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   • 2 concurrent workers (reduced from 10)
+   • 500ms delay between API calls
+   • Exponential backoff on errors
+   • 1-hour expiry caching
+   • Batch processing (10 symbols/batch)
+   • 30-second cooldown after rate limit
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📝 REMOVED FILES (Cleanup):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   ✗ 25+ duplicate/outdated documentation files
+   ✗ 8 old service scripts
+   ✗ 6 old startup scripts
+   ✗ Old test files
+   ✗ Old log files
+   ✗ SQLite database (using PostgreSQL now)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📖 DOCUMENTATION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   • README.md - Main documentation
+   • SYSTEM_FIXED.md - Details on fixes
+   • FILES.md - File inventory
+   • OVERVIEW.txt - This file
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+System is now clean, optimized, and production-ready! 🎉

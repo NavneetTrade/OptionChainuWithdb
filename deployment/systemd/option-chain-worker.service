@@ -1,0 +1,28 @@
+# Systemd service for background worker
+# For Oracle Cloud / VPS deployment
+# Location: /etc/systemd/system/option-chain-worker.service
+
+[Unit]
+Description=Option Chain Background Data Collection Service
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/option-chain/OptionChainUsingUpstock
+Environment="PATH=/home/ubuntu/option-chain/OptionChainUsingUpstock/venv/bin"
+Environment="TZ=Asia/Kolkata"
+ExecStart=/home/ubuntu/option-chain/OptionChainUsingUpstock/venv/bin/python background_service.py --force
+
+# Restart on failure
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/home/ubuntu/option-chain/OptionChainUsingUpstock/logs/worker.log
+StandardError=append:/home/ubuntu/option-chain/OptionChainUsingUpstock/logs/worker-error.log
+
+[Install]
+WantedBy=multi-user.target

@@ -18,6 +18,7 @@ pytz>=2023.3
 
 # Configuration
 toml>=0.10.2
+python-dotenv>=1.0.0
 
 # Optional auto-refresh
 streamlit-autorefresh>=0.0.6

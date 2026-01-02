@@ -10,9 +10,15 @@ import threading
 import time
 from queue import Queue
 from typing import Dict, Set, Optional, List
-import websockets
 from datetime import datetime
 import pytz
+
+# Optional websockets import - can work without it using REST API
+try:
+    import websockets
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
