@@ -8,11 +8,11 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        'gamma-red': '#FF4B4B',
-        'gamma-green': '#00C853',
-        'gamma-blue': '#2962FF',
+        'gamma-red': '#FF5555',
+        'gamma-green': '#00E676',
+        'gamma-blue': '#448AFF',
         'dark-bg': '#0E1117',
-        'dark-card': '#262730',
+        'dark-card': '#1E1E2E',
       },
     },
   },

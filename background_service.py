@@ -715,12 +715,20 @@ class OptionChainBackgroundService:
                     # Get all expiry dates and sort them (earliest first = current expiry)
                     expiry_dates = sorted({c['expiry'] for c in contracts_data['data'] if 'expiry' in c})
                     if expiry_dates:
-                        # Return the earliest (nearest/current) expiry
-                        nearest_expiry = expiry_dates[0]
-                        # Cache the result
-                        self.expiry_cache[cache_key] = (nearest_expiry, time.time())
-                        logger.debug(f"Found and cached nearest expiry for {symbol}: {nearest_expiry}")
-                        return nearest_expiry
+                        # Filter out expired dates (keep today and future dates only)
+                        today = datetime.now(IST).date()
+                        future_expiries = [exp for exp in expiry_dates if datetime.strptime(exp, '%Y-%m-%d').date() >= today]
+                        
+                        if future_expiries:
+                            # Return the earliest non-expired expiry
+                            nearest_expiry = future_expiries[0]
+                            # Cache the result
+                            self.expiry_cache[cache_key] = (nearest_expiry, time.time())
+                            logger.debug(f"Found and cached nearest expiry for {symbol}: {nearest_expiry}")
+                            return nearest_expiry
+                        else:
+                            logger.warning(f"All expiries are in the past for {symbol}")
+                            return None
                 
                 # If no data but no error, might be valid (no contracts available)
                 if not error:
@@ -746,6 +754,60 @@ class OptionChainBackgroundService:
                     return None
         
         return None
+    
+    def _get_all_expiries(self, symbol: str, instrument_key: str, max_expiries: int = 2) -> List[str]:
+        """Get multiple future expiry dates for a symbol to ensure next week's expiry is available
+        
+        Args:
+            symbol: Trading symbol
+            instrument_key: Upstox instrument key
+            max_expiries: Maximum number of expiries to return (default 2 for current + next week)
+            
+        Returns:
+            List of expiry dates in YYYY-MM-DD format, sorted ascending
+        """
+        max_retries = 2
+        base_delay = 0.1
+        
+        for attempt in range(max_retries):
+            try:
+                wait_time = base_delay * (2 ** attempt) if attempt > 0 else base_delay
+                time.sleep(wait_time)
+                
+                contracts_data, error = self.upstox_api.get_option_contracts(instrument_key)
+                
+                if error:
+                    if attempt < max_retries - 1:
+                        continue
+                    logger.warning(f"Failed to get expiries for {symbol}: {error}")
+                    return []
+                
+                if contracts_data and 'data' in contracts_data:
+                    # Get all expiry dates and sort them
+                    expiry_dates = sorted({c['expiry'] for c in contracts_data['data'] if 'expiry' in c})
+                    
+                    if expiry_dates:
+                        # Filter for future dates only (today onwards)
+                        today = datetime.now(IST).date()
+                        future_expiries = [
+                            exp for exp in expiry_dates 
+                            if datetime.strptime(exp, '%Y-%m-%d').date() >= today
+                        ]
+                        
+                        # Return up to max_expiries
+                        result = future_expiries[:max_expiries]
+                        logger.debug(f"Found {len(result)} future expiries for {symbol}: {result}")
+                        return result
+                
+                return []
+                    
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    continue
+                logger.warning(f"Exception getting expiries for {symbol}: {e}")
+                return []
+        
+        return []
     
     def _fetch_and_store_option_chain(self, symbol: str, instrument_key: str, 
                                       expiry_date: str) -> bool:
@@ -1599,64 +1661,51 @@ class OptionChainBackgroundService:
     
     def _process_symbol(self, symbol_config: Dict) -> bool:
         """
-        Process a single symbol: get expiry and fetch data
-        OPTIMIZED: Uses cached expiry to reduce API calls dramatically
+        Process a single symbol: get expiries and fetch data for multiple weeks
+        UPDATED: Fetches current + next week expiries to ensure continuity
         
         Args:
             symbol_config: Symbol configuration dictionary
             
         Returns:
-            True if successful, False otherwise
+            True if at least one expiry was successfully processed
         """
         symbol = symbol_config['symbol']
         instrument_key = symbol_config['instrument_key']
         
         try:
-            # OPTIMIZATION: Try to get expiry from cache first or database
-            # Only call API if truly necessary (max once per hour per symbol)
-            cache_key = f"{symbol}_{instrument_key}"
+            # Get multiple expiries (current + next week)
+            expiry_dates = self._get_all_expiries(symbol, instrument_key, max_expiries=2)
             
-            expiry_date = None
+            if not expiry_dates:
+                # Fallback to single expiry method
+                single_expiry = self._get_latest_expiry(symbol, instrument_key)
+                if single_expiry:
+                    expiry_dates = [single_expiry]
+                else:
+                    logger.warning(f"No expiry found for {symbol}")
+                    return False
             
-            # Check if we have cached expiry (valid for 1 hour)
-            if cache_key in self.expiry_cache:
-                cached_expiry, cache_time = self.expiry_cache[cache_key]
-                if time.time() - cache_time < 3600:  # 1 hour cache
-                    expiry_date = cached_expiry
-                    logger.debug(f"Using cached expiry for {symbol}: {expiry_date}")
-            
-            # If no valid cache, try to get from database (from previous run)
-            if not expiry_date and self.db_manager:
+            # Fetch data for each expiry (typically current week and next week)
+            success_count = 0
+            for expiry_date in expiry_dates:
                 try:
-                    with self.db_manager.get_connection() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute("""
-                                SELECT DISTINCT expiry_date 
-                                FROM option_chain_data 
-                                WHERE symbol = %s
-                                ORDER BY expiry_date ASC
-                                LIMIT 1
-                            """, (symbol,))
-                            result = cur.fetchone()
-                            if result and result[0]:
-                                expiry_date = str(result[0])
-                                # Cache it
-                                self.expiry_cache[cache_key] = (expiry_date, time.time())
-                                logger.debug(f"Using DB expiry for {symbol}: {expiry_date}")
-                except:
-                    pass  # Continue to API call
+                    if self._fetch_and_store_option_chain(symbol, instrument_key, expiry_date):
+                        success_count += 1
+                        # Small delay between expiries to avoid rate limits
+                        if len(expiry_dates) > 1:
+                            time.sleep(0.2)
+                except Exception as e:
+                    logger.debug(f"Error fetching {symbol} {expiry_date}: {e}")
+                    continue
             
-            # Only call API to get expiry if we have no cached or DB value
-            if not expiry_date:
-                logger.debug(f"Fetching expiry from API for {symbol}")
-                expiry_date = self._get_latest_expiry(symbol, instrument_key)
-            
-            if not expiry_date:
-                logger.warning(f"No expiry found for {symbol}")
+            # Consider successful if at least one expiry was fetched
+            if success_count > 0:
+                logger.debug(f"✓ {symbol}: Fetched {success_count}/{len(expiry_dates)} expiries")
+                return True
+            else:
+                logger.warning(f"Failed to fetch any expiry for {symbol}")
                 return False
-            
-            # Fetch and store data
-            return self._fetch_and_store_option_chain(symbol, instrument_key, expiry_date)
             
         except Exception as e:
             logger.error(f"Error processing symbol {symbol}: {e}")

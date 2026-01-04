@@ -26,3 +26,8 @@ streamlit-autorefresh>=0.0.6
 # WebSocket support
 websockets>=12.0
 
+# FastAPI Backend (for Next.js UI)
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+aiofiles>=23.2.1
