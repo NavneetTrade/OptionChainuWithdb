@@ -687,7 +687,7 @@ export default function EnhancedOptionChain() {
                   {filteredStrikes.map((strike, idx) => (
                     <tr 
                       key={idx}
-                      className={strike.is_atm ? 'bg-yellow-50 font-semibold' : ''}
+                      className={strike.is_atm ? 'bg-blue-900/30 border-2 border-blue-500' : ''}
                     >
                       {/* CE Data */}
                       <td className="px-2 py-2 text-sm text-right">{formatNumber(strike.call.oi)}</td>
@@ -709,8 +709,10 @@ export default function EnhancedOptionChain() {
                       </td>
                       
                       {/* Strike */}
-                      <td className="px-2 py-2 text-sm font-bold text-center bg-yellow-50">
-                        {strike.strike.toFixed(0)}
+                      <td className={`px-2 py-2 text-sm font-bold text-center ${
+                        strike.is_atm ? 'text-yellow-400 text-lg bg-blue-800' : 'text-cyan-400 bg-gray-900'
+                      }`}>
+                        ₹{strike.strike.toFixed(0)}
                       </td>
                       
                       {/* PE Data */}

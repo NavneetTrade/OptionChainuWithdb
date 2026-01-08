@@ -411,7 +411,7 @@ async def get_option_chain(symbol: str, expiry: Optional[str] = None):
                     
                     strikes.append({
                         "strike": strike,
-                        "is_atm": abs(strike - spot_price) < 50,  # Mark ATM strike
+                        "is_atm": False,  # Will be set later to only the nearest strike
                         "call": {
                             "ltp": float(row[3]) if row[3] else 0,
                             "change": float(row[4]) if row[4] else 0,
@@ -439,6 +439,11 @@ async def get_option_chain(symbol: str, expiry: Optional[str] = None):
                             "position": pe_position
                         }
                     })
+                
+                # Mark only the nearest strike as ATM
+                if strikes:
+                    nearest_strike = min(strikes, key=lambda s: abs(s["strike"] - spot_price))
+                    nearest_strike["is_atm"] = True
                 
                 # Calculate PCR ratios (same as Streamlit)
                 total_ce_oi = sum(s["call"]["oi"] for s in strikes)
