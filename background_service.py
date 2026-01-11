@@ -114,7 +114,8 @@ class AdaptiveGammaBlastDetector:
             historical_data: List of past metrics (last 20+ periods)
         """
         
-        probability = 0.0
+        # Store individual signal strengths (each normalized 0-1)
+        signals = {}
         triggers = []
         
         # Extract current metrics
@@ -131,30 +132,37 @@ class AdaptiveGammaBlastDetector:
         hist_gamma_conc = [d.get('gamma_concentration', 0) for d in historical_data]
         hist_gex = [d.get('net_gex', 0) for d in historical_data]
         
-        # SIGNAL 1: IV Z-Score Spike (hybrid: z-score/percentile/threshold)
+        # SIGNAL 1: IV Z-Score Spike (normalized 0-1)
         # Fallback threshold: IV > 30 for indices/stocks is elevated
         iv_zscore = self.calculate_z_score_or_threshold(curr_iv, hist_iv, fallback_threshold=30)
         
         if len(hist_iv) >= 10:  # Z-score interpretation
             if iv_zscore > 2.5:  # 2.5 std devs above mean
-                probability += 0.25
+                signals['iv'] = 1.0
                 triggers.append(f"IV Spike ({iv_zscore:.1f}σ)")
             elif iv_zscore > 2.0:
-                probability += 0.15
+                signals['iv'] = 0.6
                 triggers.append(f"IV Elevated ({iv_zscore:.1f}σ)")
             elif iv_zscore < -2.0:  # IV collapsing
-                probability += 0.15
+                signals['iv'] = 0.6  # IV collapse also predictive
                 triggers.append(f"IV Collapse ({iv_zscore:.1f}σ)")
+            else:
+                # Linear scale from 1σ to 2.5σ
+                signals['iv'] = max(0, min(1.0, (abs(iv_zscore) - 1.0) / 1.5))
         elif len(hist_iv) >= 3:  # Percentile interpretation
             if iv_zscore > 0:  # Above 75th percentile
-                probability += 0.20
+                signals['iv'] = 0.8
                 triggers.append("IV Elevated (>P75)")
             elif iv_zscore < 0:  # Below 25th percentile
-                probability += 0.15
+                signals['iv'] = 0.6
                 triggers.append("IV Collapsed (<P25)")
+            else:
+                signals['iv'] = 0.3
         elif iv_zscore > 0:  # Absolute threshold
-            probability += 0.15
+            signals['iv'] = 0.5
             triggers.append(f"IV High (>{curr_iv:.1f})")
+        else:
+            signals['iv'] = 0.0
         
         # SIGNAL 2: OI Acceleration (2nd derivative with adaptive threshold)
         if len(historical_data) >= 3:
@@ -183,85 +191,154 @@ class AdaptiveGammaBlastDetector:
                 
                 if len(hist_accelerations) >= 10:  # Z-score interpretation
                     if accel_zscore < -2.0:  # Rapid unwinding (2σ below mean)
-                        probability += 0.30
+                        signals['oi_accel'] = 1.0  # Unwinding most predictive
                         triggers.append(f"OI Unwinding ({accel_zscore:.1f}σ)")
                     elif accel_zscore > 2.0:  # Rapid buildup (2σ above mean)
-                        probability += 0.20
+                        signals['oi_accel'] = 0.7  # Buildup somewhat predictive
                         triggers.append(f"OI Buildup ({accel_zscore:.1f}σ)")
+                    else:
+                        # Linear scale for moderate z-scores
+                        signals['oi_accel'] = max(0, abs(accel_zscore) / 2.5)
                 elif len(hist_accelerations) >= 3:  # Percentile interpretation
                     if accel_zscore < 0:  # Below 25th percentile (unwinding)
-                        probability += 0.25
+                        signals['oi_accel'] = 0.8
                         triggers.append("OI Unwinding (<P25)")
                     elif accel_zscore > 0:  # Above 75th percentile (buildup)
-                        probability += 0.20
+                        signals['oi_accel'] = 0.6
                         triggers.append("OI Buildup (>P75)")
+                    else:
+                        signals['oi_accel'] = 0.3
                 elif abs(accel_zscore) > 0:  # Absolute threshold
                     if acceleration < 0:
-                        probability += 0.20
+                        signals['oi_accel'] = 0.6
                         triggers.append(f"OI Unwinding ({acceleration:.0f})")
                     else:
-                        probability += 0.15
+                        signals['oi_accel'] = 0.4
                         triggers.append(f"OI Buildup ({acceleration:.0f})")
+                else:
+                    signals['oi_accel'] = 0.0
+            else:
+                signals['oi_accel'] = 0.0
+        else:
+            signals['oi_accel'] = 0.0
         
-        # SIGNAL 3: Gamma Concentration Expansion (hybrid)
+        # SIGNAL 3: Gamma Concentration Expansion (normalized 0-1)
         # Fallback: concentration > 60% is high clustering
         gamma_zscore = self.calculate_z_score_or_threshold(curr_gamma_conc, hist_gamma_conc, fallback_threshold=0.6)
         
         if len(hist_gamma_conc) >= 10:
             if gamma_zscore > 2.0:
-                probability += 0.20
+                signals['gamma_conc'] = 1.0
                 triggers.append(f"Gamma Clustering ({gamma_zscore:.1f}σ)")
+            else:
+                signals['gamma_conc'] = max(0, min(1.0, gamma_zscore / 2.5))
         elif len(hist_gamma_conc) >= 3:
             if gamma_zscore > 0:  # Above 75th percentile
-                probability += 0.20
+                signals['gamma_conc'] = 0.8
                 triggers.append("Gamma Clustering (>P75)")
+            else:
+                signals['gamma_conc'] = 0.0
         elif gamma_zscore > 0:  # Absolute threshold
-            probability += 0.15
+            signals['gamma_conc'] = 0.6
             triggers.append(f"High Gamma Conc ({curr_gamma_conc:.1%})")
+        else:
+            signals['gamma_conc'] = 0.0
         
-        # SIGNAL 4: Strike Pin Risk (distance from high OI strike)
+        # SIGNAL 4: Strike Pin Risk (normalized 0-1)
         if atm_strike > 0:
             distance_pct = abs(spot - atm_strike) / spot * 100
-            if distance_pct < 0.5:  # Very close to ATM
-                probability += 0.10
+            if distance_pct < 0.3:  # Very close to ATM
+                signals['pin_risk'] = 1.0
                 triggers.append(f"Pin Risk ({distance_pct:.2f}%)")
+            elif distance_pct < 0.5:
+                signals['pin_risk'] = 0.6
+                triggers.append(f"Pin Risk ({distance_pct:.2f}%)")
+            elif distance_pct < 1.0:
+                signals['pin_risk'] = 0.3
+            else:
+                signals['pin_risk'] = 0.0
+        else:
+            signals['pin_risk'] = 0.0
         
-        # SIGNAL 5: GEX Flip Detection (crossing zero)
+        # SIGNAL 5: GEX Flip Detection (normalized 0-1)
         if len(hist_gex) > 0:
             prev_gex = hist_gex[-1]
             if (prev_gex > 0 and curr_gex < 0) or (prev_gex < 0 and curr_gex > 0):
-                probability += 0.25
-                triggers.append("GEX Flip Detected")
+                # Check magnitude of flip
+                flip_magnitude = abs(curr_gex - prev_gex)
+                if flip_magnitude > abs(prev_gex) * 0.5:  # Significant flip
+                    signals['gex_flip'] = 1.0
+                    triggers.append("GEX Flip Detected (Strong)")
+                else:
+                    signals['gex_flip'] = 0.6
+                    triggers.append("GEX Flip Detected")
+            else:
+                signals['gex_flip'] = 0.0
+        else:
+            signals['gex_flip'] = 0.0
         
-        # SIGNAL 6: GEX Extremes (adaptive percentile-based)
+        # SIGNAL 6: GEX Extremes (normalized 0-1)
         if len(hist_gex) >= 10:
             gex_percentile = (sum(1 for g in hist_gex if g <= curr_gex) / len(hist_gex)) * 100
-            if gex_percentile > 90:  # Top 10% (high resistance)
-                probability += 0.15
+            if gex_percentile > 95:  # Top 5% (extreme resistance)
+                signals['gex_extreme'] = 1.0
                 triggers.append(f"Extreme GEX ({gex_percentile:.0f}th percentile)")
-            elif gex_percentile < 10:  # Bottom 10% (high support)
-                probability += 0.15
+            elif gex_percentile > 90:  # Top 10%
+                signals['gex_extreme'] = 0.7
+                triggers.append(f"High GEX ({gex_percentile:.0f}th percentile)")
+            elif gex_percentile < 5:  # Bottom 5% (extreme support)
+                signals['gex_extreme'] = 1.0
                 triggers.append(f"Extreme GEX ({gex_percentile:.0f}th percentile)")
+            elif gex_percentile < 10:  # Bottom 10%
+                signals['gex_extreme'] = 0.7
+                triggers.append(f"Low GEX ({gex_percentile:.0f}th percentile)")
+            else:
+                signals['gex_extreme'] = 0.0
+        else:
+            signals['gex_extreme'] = 0.0
         
+        # WEIGHTED PROBABILITY CALCULATION (weights sum to 1.0)
+        weights = {
+            'iv': 0.25,           # IV volatility spike - strong predictor
+            'oi_accel': 0.30,     # OI acceleration - strongest predictor
+            'gamma_conc': 0.20,   # Gamma concentration - moderate predictor
+            'pin_risk': 0.10,     # Pin risk - minor predictor
+            'gex_flip': 0.10,     # GEX flip - moderate predictor
+            'gex_extreme': 0.05   # GEX extremes - weak predictor
+        }
+        
+        probability = sum(signals.get(key, 0) * weight for key, weight in weights.items())
         # Cap probability at 0.95
         probability = min(0.95, probability)
         
         # DIRECTION PREDICTION using weighted signals
         direction_score = 0
         
-        # Put/Call OI ratio
+        # PRIMARY SIGNAL: ITM Change in OI (most predictive - smart money)
+        ce_itm_chg_oi = current_data.get('ce_itm_chg_oi', 0)
+        pe_itm_chg_oi = current_data.get('pe_itm_chg_oi', 0)
+        
+        # ITM CE unwinding (negative) = Bullish (price expected to rise)
+        # ITM PE unwinding (negative) = Bearish (price expected to fall)
+        if ce_itm_chg_oi < -10000:  # Significant CE ITM unwinding
+            direction_score += 3  # Strong bullish
+        elif ce_itm_chg_oi < 0:
+            direction_score += 2  # Bullish
+        
+        if pe_itm_chg_oi < -10000:  # Significant PE ITM unwinding
+            direction_score -= 3  # Strong bearish
+        elif pe_itm_chg_oi < 0:
+            direction_score -= 2  # Bearish
+        
+        # SECONDARY: Overall PCR
         ce_oi_total = current_data.get('ce_oi_total', 0)
         pe_oi_total = current_data.get('pe_oi_total', 0)
         pcr = pe_oi_total / ce_oi_total if ce_oi_total > 0 else 1
         
         if pcr < 0.7:
-            direction_score += 3  # Heavy call OI = bullish
-        elif pcr < 0.85:
-            direction_score += 1
+            direction_score += 1  # Heavy call OI = bullish
         elif pcr > 1.3:
-            direction_score -= 3  # Heavy put OI = bearish
-        elif pcr > 1.15:
-            direction_score -= 1
+            direction_score -= 1  # Heavy put OI = bearish
         
         # GEX direction (adaptive using percentile)
         if len(hist_gex) >= 5:
@@ -282,30 +359,39 @@ class AdaptiveGammaBlastDetector:
             elif pe_iv_avg > ce_iv_avg * 1.1:
                 direction_score += 1  # Puts expensive = bullish expectation
         
-        # Determine direction
-        if direction_score >= 3:
+        # Spot price momentum (check recent trend)
+        if len(historical_data) >= 3:
+            recent_spots = [d.get('spot_price', 0) for d in list(historical_data)[-3:]]
+            if all(recent_spots[i] > recent_spots[i+1] for i in range(len(recent_spots)-1)):
+                direction_score -= 2  # Consistent downtrend
+            elif all(recent_spots[i] < recent_spots[i+1] for i in range(len(recent_spots)-1)):
+                direction_score += 2  # Consistent uptrend
+        
+        # Determine direction with lower threshold
+        if direction_score >= 2:
             direction = "UPSIDE"
-        elif direction_score <= -3:
+        elif direction_score <= -2:
             direction = "DOWNSIDE"
         else:
             direction = "NEUTRAL"
         
         # CONFIDENCE based on trigger count and probability
+        # NOTE: time_to_blast removed - timing prediction requires historical calibration
+        # which is not yet implemented. Until calibrated, time predictions are unreliable.
         if probability > 0.7 and len(triggers) >= 4:
             confidence = "CRITICAL"
-            time_to_blast = 3  # Minutes
         elif probability > 0.6 and len(triggers) >= 3:
             confidence = "VERY_HIGH"
-            time_to_blast = 10
         elif probability > 0.4:
             confidence = "HIGH"
-            time_to_blast = 20
         elif probability > 0.25:
             confidence = "MEDIUM"
-            time_to_blast = 30
         else:
             confidence = "LOW"
-            time_to_blast = 60
+        
+        # Time to blast: Conservative estimates based on confidence
+        # TODO: Replace with ML-calibrated timing model using historical blast events
+        time_to_blast = 60  # Default: monitor for next hour
         
         # RISK LEVEL
         if probability > 0.75:
@@ -553,6 +639,53 @@ class OptionChainBackgroundService:
         # Market is open only between 9:15 AM and 3:30 PM
         # After 3:30 PM, return False so service stops fetching data
         return market_open <= current_time <= market_close
+    
+    def _cleanup_non_market_hours_data(self):
+        """Delete data collected outside market hours (before 9:15 AM and after 3:30 PM IST)"""
+        try:
+            logger.info("🧹 Starting cleanup of non-market hours data...")
+            
+            with self.db_manager.get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Delete option chain data outside market hours
+                    cur.execute("""
+                        DELETE FROM option_chain_data
+                        WHERE (
+                            EXTRACT(HOUR FROM timestamp AT TIME ZONE 'Asia/Kolkata') < 9
+                            OR (EXTRACT(HOUR FROM timestamp AT TIME ZONE 'Asia/Kolkata') = 9 
+                                AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'Asia/Kolkata') < 15)
+                            OR EXTRACT(HOUR FROM timestamp AT TIME ZONE 'Asia/Kolkata') > 15
+                            OR (EXTRACT(HOUR FROM timestamp AT TIME ZONE 'Asia/Kolkata') = 15 
+                                AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'Asia/Kolkata') > 30)
+                        )
+                        AND timestamp > NOW() - INTERVAL '7 days'
+                    """)
+                    option_deleted = cur.rowcount
+                    
+                    # Delete gamma exposure history outside market hours
+                    cur.execute("""
+                        DELETE FROM gamma_exposure_history
+                        WHERE (
+                            EXTRACT(HOUR FROM timestamp AT TIME ZONE 'Asia/Kolkata') < 9
+                            OR (EXTRACT(HOUR FROM timestamp AT TIME ZONE 'Asia/Kolkata') = 9 
+                                AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'Asia/Kolkata') < 15)
+                            OR EXTRACT(HOUR FROM timestamp AT TIME ZONE 'Asia/Kolkata') > 15
+                            OR (EXTRACT(HOUR FROM timestamp AT TIME ZONE 'Asia/Kolkata') = 15 
+                                AND EXTRACT(MINUTE FROM timestamp AT TIME ZONE 'Asia/Kolkata') > 30)
+                        )
+                        AND timestamp > NOW() - INTERVAL '7 days'
+                    """)
+                    gamma_deleted = cur.rowcount
+                    
+                    conn.commit()
+                    
+                    if option_deleted > 0 or gamma_deleted > 0:
+                        logger.info(f"✅ Cleanup complete: Deleted {option_deleted} option records and {gamma_deleted} gamma records outside market hours")
+                    else:
+                        logger.debug("No non-market hours data found to clean")
+                        
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
     
     def _get_fo_instruments(self) -> Dict[str, str]:
         """Get F&O instruments mapping - ONLY ACTIVE stocks with current expiry"""
@@ -976,6 +1109,7 @@ class OptionChainBackgroundService:
                 ce_close = call_market.get('close_price', 0) or 0
                 ce_chgoi = ce_oi - (call_market.get('prev_oi', 0) or 0)
                 ce_change = ce_ltp - ce_close if ce_close > 0 else 0
+                ce_delta = call_greeks.get('delta', 0) or 0
                 
                 pe_oi = put_market.get('oi', 0) or 0
                 pe_volume = put_market.get('volume', 0) or 0
@@ -983,6 +1117,7 @@ class OptionChainBackgroundService:
                 pe_close = put_market.get('close_price', 0) or 0
                 pe_chgoi = pe_oi - (put_market.get('prev_oi', 0) or 0)
                 pe_change = pe_ltp - pe_close if pe_close > 0 else 0
+                pe_delta = put_greeks.get('delta', 0) or 0
                 
                 # Calculate position signals
                 def get_position_signal(ltp, change, chgoi):
@@ -1005,12 +1140,14 @@ class OptionChainBackgroundService:
                     'CE_LTP': ce_ltp,
                     'CE_Change': ce_change,
                     'CE_Position': get_position_signal(ce_ltp, ce_change, ce_chgoi),
+                    'ce_delta': ce_delta,
                     'PE_OI': pe_oi,
                     'PE_Volume': pe_volume,
                     'PE_ChgOI': pe_chgoi,
                     'PE_LTP': pe_ltp,
                     'PE_Change': pe_change,
                     'PE_Position': get_position_signal(pe_ltp, pe_change, pe_chgoi),
+                    'pe_delta': pe_delta,
                 })
             
             if not processed_data:
@@ -1479,6 +1616,10 @@ class OptionChainBackgroundService:
             ce_iv_avg = sum(call_ivs) / len(call_ivs) if call_ivs else 0
             pe_iv_avg = sum(put_ivs) / len(put_ivs) if put_ivs else 0
             
+            # Calculate ITM change in OI (key directional indicator)
+            ce_itm_chg_oi = df[df['strike'] < spot_price]['ce_chg_oi'].sum() if 'ce_chg_oi' in df.columns else 0
+            pe_itm_chg_oi = df[df['strike'] > spot_price]['pe_chg_oi'].sum() if 'pe_chg_oi' in df.columns else 0
+            
             # Prepare current data for detector
             current_data = {
                 'atm_iv': atm_iv,
@@ -1490,7 +1631,9 @@ class OptionChainBackgroundService:
                 'ce_oi_total': df['ce_oi'].sum() if 'ce_oi' in df.columns else 0,
                 'pe_oi_total': df['pe_oi'].sum() if 'pe_oi' in df.columns else 0,
                 'ce_iv_avg': ce_iv_avg,
-                'pe_iv_avg': pe_iv_avg
+                'pe_iv_avg': pe_iv_avg,
+                'ce_itm_chg_oi': ce_itm_chg_oi,
+                'pe_itm_chg_oi': pe_itm_chg_oi
             }
             
             # Use adaptive detector (handles insufficient data gracefully with z-score=0)
@@ -1869,6 +2012,12 @@ class OptionChainBackgroundService:
         logger.info("💾 Expiry cache: Daily (reset at market close)")
         logger.info("🕐 Market hours: 9:15 AM - 3:30 PM IST (Monday-Friday)")
         logger.info("=" * 70)
+        
+        # Clean up non-market hours data at startup
+        try:
+            self._cleanup_non_market_hours_data()
+        except Exception as e:
+            logger.error(f"Error during startup cleanup: {e}")
         
         # Start separate thread for fast index refresh
         if not self.use_websocket:
