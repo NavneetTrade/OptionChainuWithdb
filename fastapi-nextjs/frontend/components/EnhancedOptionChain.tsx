@@ -843,11 +843,14 @@ export default function EnhancedOptionChain() {
                   
                   <div className="bg-gray-900/70 p-3 rounded-lg border border-gray-700">
                     <div className="flex items-center gap-2 mb-1">
-                      <span className="text-xl">⏱️</span>
-                      <div className="text-xs text-gray-400">Time to Blast</div>
+                      <span className="text-xl">⏰</span>
+                      <div className="text-xs text-gray-400">Monitoring Window</div>
                     </div>
-                    <div className="text-2xl font-bold text-orange-400">
-                      {gammaBlastData.time_to_blast_minutes ? `${gammaBlastData.time_to_blast_minutes}m` : 'N/A'}
+                    <div className="text-xl font-bold text-blue-400">
+                      Monitor Next Hour
+                    </div>
+                    <div className="text-xs text-gray-500 mt-1">
+                      Timing requires calibration
                     </div>
                   </div>
                 </div>
