@@ -389,9 +389,9 @@ class AdaptiveGammaBlastDetector:
         else:
             confidence = "LOW"
         
-        # Time to blast: Conservative estimates based on confidence
-        # TODO: Replace with ML-calibrated timing model using historical blast events
-        time_to_blast = 60  # Default: monitor for next hour
+        # Time to blast: Removed - requires ML calibration with historical data
+        # TODO: Implement ML-calibrated timing model using historical blast events
+        time_to_blast = None  # Not available until calibrated
         
         # RISK LEVEL
         if probability > 0.75:

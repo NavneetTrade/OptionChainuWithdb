@@ -2649,7 +2649,9 @@ def display_gamma_leading_indicators(gex_df=None, spot_price=None, table=None, s
             st.metric("Predicted Direction", f"{direction_icon} {direction}")
         
         with col4:
-            st.metric("Time to Blast", f"{int(time_to_blast)}m", delta=None)
+            # Time to blast requires calibration - show monitoring window instead
+            time_display = "Monitor Next Hour" if time_to_blast is None else f"{int(time_to_blast)}m"
+            st.metric("Monitoring Window", time_display, delta=None, help="Specific timing requires historical calibration")
         
         # Display detailed metrics
         st.markdown("### 📊 Detailed Indicator Breakdown")
