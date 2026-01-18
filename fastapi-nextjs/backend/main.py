@@ -155,24 +155,48 @@ async def get_gamma_exposure(symbol: str):
 
 @app.get("/api/gamma/history/{symbol}")
 async def get_gamma_history(symbol: str, hours: int = 24):
-    """Get historical gamma exposure data for a symbol"""
+    """Get historical gamma exposure data for a symbol - filtered by current expiry"""
     try:
         with db.get_connection() as conn:
             with conn.cursor() as cur:
+                # First get the current (nearest) expiry for this symbol
+                cur.execute("""
+                    SELECT MIN(expiry_date) 
+                    FROM gamma_exposure_history 
+                    WHERE symbol = %s AND expiry_date >= CURRENT_DATE
+                """, (symbol,))
+                result = cur.fetchone()
+                
+                if result and result[0]:
+                    current_expiry = result[0]
+                else:
+                    # Fallback to latest expiry if no future expiry found
+                    cur.execute("""
+                        SELECT MAX(expiry_date) FROM gamma_exposure_history WHERE symbol = %s
+                    """, (symbol,))
+                    result = cur.fetchone()
+                    current_expiry = result[0] if result else None
+                
+                if not current_expiry:
+                    return {"symbol": symbol, "data": [], "count": 0, "expiry": None}
+                
+                # Now fetch data filtered by current expiry only
                 cur.execute("""
                     SELECT 
                         timestamp, net_gex, atm_iv, atm_oi,
                         gamma_blast_probability, oi_velocity, iv_velocity
                     FROM gamma_exposure_history
                     WHERE symbol = %s 
+                        AND expiry_date = %s
                         AND timestamp > NOW() - INTERVAL '%s hours'
                     ORDER BY timestamp ASC
-                """, (symbol, hours))
+                """, (symbol, current_expiry, hours))
                 
                 rows = cur.fetchall()
                 
                 return {
                     "symbol": symbol,
+                    "expiry": str(current_expiry),
                     "data": [
                         {
                             "timestamp": row[0].isoformat(),
@@ -191,6 +215,7 @@ async def get_gamma_history(symbol: str, hours: int = 24):
         logger.error(f"Error fetching history for {symbol}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/api/indices")
 async def get_indices_overview():
     """Get overview of all indices (NIFTY, BANKNIFTY, etc.)"""
@@ -201,16 +226,35 @@ async def get_indices_overview():
         with db.get_connection() as conn:
             with conn.cursor() as cur:
                 for symbol in indices:
+                    # First get the current (nearest) expiry
+                    cur.execute("""
+                        SELECT MIN(expiry_date) 
+                        FROM gamma_exposure_history 
+                        WHERE symbol = %s AND expiry_date >= CURRENT_DATE
+                    """, (symbol,))
+                    expiry_result = cur.fetchone()
+                    current_expiry = expiry_result[0] if expiry_result and expiry_result[0] else None
+                    
+                    if not current_expiry:
+                        cur.execute("""
+                            SELECT MAX(expiry_date) FROM gamma_exposure_history WHERE symbol = %s
+                        """, (symbol,))
+                        expiry_result = cur.fetchone()
+                        current_expiry = expiry_result[0] if expiry_result else None
+                    
+                    if not current_expiry:
+                        continue
+                    
                     cur.execute("""
                         SELECT 
                             symbol, timestamp, net_gex, atm_iv, atm_oi,
                             gamma_blast_probability, predicted_direction,
                             oi_velocity, iv_velocity
                         FROM gamma_exposure_history
-                        WHERE symbol = %s
+                        WHERE symbol = %s AND expiry_date = %s
                         ORDER BY timestamp DESC
                         LIMIT 1
-                    """, (symbol,))
+                    """, (symbol, current_expiry))
                     
                     row = cur.fetchone()
                     if row:
