@@ -84,11 +84,11 @@ export default function GammaBlastTable({ onSymbolClick, liveData }: GammaBlastT
                 </td>
                 <td className="px-4 py-3 text-center">
                   <span className={`font-semibold ${
-                    blast.direction === 'BULLISH' ? 'text-gamma-green' :
-                    blast.direction === 'BEARISH' ? 'text-gamma-red' : 'text-gray-400'
+                    blast.direction === 'UPSIDE' ? 'text-gamma-green' :
+                    blast.direction === 'DOWNSIDE' ? 'text-gamma-red' : 'text-gray-400'
                   }`}>
-                    {blast.direction === 'BULLISH' ? '📈 Bullish' :
-                     blast.direction === 'BEARISH' ? '📉 Bearish' : '➡️ Neutral'}
+                    {blast.direction === 'UPSIDE' ? '📈 Upside' :
+                     blast.direction === 'DOWNSIDE' ? '📉 Downside' : '➡️ Neutral'}
                   </span>
                 </td>
                 <td className="px-4 py-3 text-center text-sm">{blast.confidence}</td>
