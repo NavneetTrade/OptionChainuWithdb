@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import axios from 'axios'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
+import { formatISTTimeForChart, formatISTDateTime } from '../utils/timeUtils'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -65,26 +66,26 @@ export default function SymbolDetail({ symbol, liveData }: SymbolDetailProps) {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <MetricCard 
           title="Gamma Blast" 
-          value={`${(currentData.gamma_blast_probability * 100).toFixed(1)}%`}
+          value={`${((currentData?.gamma_blast_probability ?? 0) * 100).toFixed(1)}%`}
           subtitle={currentData.predicted_direction}
           color={currentData.gamma_blast_probability > 0.5 ? 'gamma-red' : 'gamma-green'}
         />
         <MetricCard 
           title="Net GEX" 
-          value={`${(currentData.net_gex / 1_000_000).toFixed(2)}M`}
+          value={`${((currentData?.net_gex ?? 0) / 1_000_000).toFixed(2)}M`}
           subtitle="Gamma Exposure"
           color="gamma-blue"
         />
         <MetricCard 
           title="ATM IV" 
-          value={`${currentData.atm_iv.toFixed(2)}%`}
-          subtitle={`Velocity: ${(currentData.iv_velocity * 100).toFixed(2)}%`}
+          value={`${(currentData?.atm_iv ?? 0).toFixed(2)}%`}
+          subtitle={`Velocity: ${((currentData?.iv_velocity ?? 0) * 100).toFixed(2)}%`}
           color="gamma-blue"
         />
         <MetricCard 
           title="OI Velocity" 
-          value={currentData.oi_velocity.toFixed(1)}
-          subtitle={`Acceleration: ${currentData.oi_acceleration.toFixed(1)}`}
+          value={(currentData?.oi_velocity ?? 0).toFixed(1)}
+          subtitle={`Acceleration: ${(currentData?.oi_acceleration ?? 0).toFixed(1)}`}
           color={currentData.oi_velocity > 0 ? 'gamma-green' : 'gamma-red'}
         />
       </div>
@@ -101,12 +102,12 @@ export default function SymbolDetail({ symbol, liveData }: SymbolDetailProps) {
                 dataKey="timestamp" 
                 stroke="#9CA3AF"
                 tick={{ fontSize: 12 }}
-                tickFormatter={(value) => new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                tickFormatter={(value) => formatISTTimeForChart(value)}
               />
               <YAxis stroke="#9CA3AF" tick={{ fontSize: 12 }} />
               <Tooltip 
                 contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151' }}
-                labelFormatter={(value) => new Date(value).toLocaleString()}
+                labelFormatter={(value) => formatISTDateTime(value)}
               />
               <Legend />
               <Line type="monotone" dataKey="net_gex" stroke="#2962FF" strokeWidth={2} dot={false} name="Net GEX" />
@@ -124,12 +125,12 @@ export default function SymbolDetail({ symbol, liveData }: SymbolDetailProps) {
                 dataKey="timestamp" 
                 stroke="#9CA3AF"
                 tick={{ fontSize: 12 }}
-                tickFormatter={(value) => new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                tickFormatter={(value) => formatISTTimeForChart(value)}
               />
               <YAxis stroke="#9CA3AF" tick={{ fontSize: 12 }} />
               <Tooltip 
                 contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151' }}
-                labelFormatter={(value) => new Date(value).toLocaleString()}
+                labelFormatter={(value) => formatISTDateTime(value)}
               />
               <Legend />
               <Line type="monotone" dataKey="atm_iv" stroke="#FF4B4B" strokeWidth={2} dot={false} name="ATM IV" />
@@ -147,12 +148,12 @@ export default function SymbolDetail({ symbol, liveData }: SymbolDetailProps) {
                 dataKey="timestamp" 
                 stroke="#9CA3AF"
                 tick={{ fontSize: 12 }}
-                tickFormatter={(value) => new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                tickFormatter={(value) => formatISTTimeForChart(value)}
               />
               <YAxis stroke="#9CA3AF" tick={{ fontSize: 12 }} />
               <Tooltip 
                 contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151' }}
-                labelFormatter={(value) => new Date(value).toLocaleString()}
+                labelFormatter={(value) => formatISTDateTime(value)}
               />
               <Legend />
               <Line type="monotone" dataKey="oi_velocity" stroke="#00C853" strokeWidth={2} dot={false} name="OI Velocity" />
@@ -170,12 +171,12 @@ export default function SymbolDetail({ symbol, liveData }: SymbolDetailProps) {
                 dataKey="timestamp" 
                 stroke="#9CA3AF"
                 tick={{ fontSize: 12 }}
-                tickFormatter={(value) => new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                tickFormatter={(value) => formatISTTimeForChart(value)}
               />
               <YAxis stroke="#9CA3AF" tick={{ fontSize: 12 }} domain={[0, 1]} />
               <Tooltip 
                 contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151' }}
-                labelFormatter={(value) => new Date(value).toLocaleString()}
+                labelFormatter={(value) => formatISTDateTime(value)}
                 formatter={(value: number) => `${(value * 100).toFixed(1)}%`}
               />
               <Legend />

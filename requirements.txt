@@ -20,8 +20,8 @@ pytz>=2023.3
 toml>=0.10.2
 python-dotenv>=1.0.0
 
-# Optional auto-refresh
-streamlit-autorefresh>=0.0.6
+# Auto-refresh for real-time updates
+streamlit-autorefresh>=1.0.1
 
 # WebSocket support
 websockets>=12.0

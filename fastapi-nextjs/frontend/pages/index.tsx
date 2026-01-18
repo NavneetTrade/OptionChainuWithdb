@@ -5,13 +5,9 @@ import GammaBlastTable from '../components/GammaBlastTable'
 import SymbolDetail from '../components/SymbolDetail'
 import LiveIndicator from '../components/LiveIndicator'
 import EnhancedOptionChain from '../components/EnhancedOptionChain'
-import TestComponent from '../components/TestComponent'
 import SentimentDashboard from '../components/SentimentDashboard'
 import ITMAnalysis from '../components/ITMAnalysis'
-import useWebSocket from '../hooks/useWebSocket'
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws'
+import useAutoRefresh from '../hooks/useAutoRefresh'
 
 type TabType = 'gamma' | 'optionchain' | 'sentiment' | 'itm';
 
@@ -20,8 +16,8 @@ export default function Home() {
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [activeTab, setActiveTab] = useState<TabType>('gamma')
   
-  // WebSocket connection for real-time updates
-  const { data: wsData, isConnected, error: wsError } = useWebSocket(WS_URL, autoRefresh)
+  // HTTP polling for auto-refresh (WebSocket removed - using polling only)
+  const { data: wsData, isConnected, error: wsError, mode } = useAutoRefresh(autoRefresh)
 
   const tabs = [
     { id: 'gamma' as TabType, label: 'Gamma Blast', icon: '⚡' },
@@ -89,7 +85,7 @@ export default function Home() {
           </div>
         </div>
 
-        {/* WebSocket Error */}
+        {/* Error Display */}
         {wsError && (
           <div className="container mx-auto px-4 pt-4">
             <div className="p-4 bg-red-900/20 border border-red-500 rounded-lg">
@@ -156,7 +152,7 @@ export default function Home() {
         {/* Footer */}
         <footer className="mt-12 pt-6 border-t border-gray-800 text-center text-gray-500 pb-6">
           <p className="text-sm">
-            Powered by FastAPI + Next.js | Real-time WebSocket Updates | 
+            Powered by FastAPI + Next.js | HTTP Polling Auto-Refresh | 
             Data updates every {autoRefresh ? '5' : '∞'} seconds
           </p>
         </footer>

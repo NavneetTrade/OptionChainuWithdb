@@ -27,6 +27,22 @@ try:
     AUTORFR = True
 except ImportError:
     AUTORFR = False
+    # Fallback: Use built-in Streamlit mechanism
+    def st_autorefresh(interval, limit=None, key=None):
+        """Fallback auto-refresh using Streamlit's built-in time.sleep + rerun"""
+        import time
+        if 'last_refresh_time' not in st.session_state:
+            st.session_state.last_refresh_time = time.time()
+        
+        current_time = time.time()
+        elapsed = (current_time - st.session_state.last_refresh_time) * 1000  # to milliseconds
+        
+        if elapsed >= interval:
+            st.session_state.last_refresh_time = current_time
+            time.sleep(0.1)  # Small delay to prevent rapid reruns
+            st.rerun()
+        
+        return int(elapsed / interval)
 
 # Import sentiment dashboard module
 try:
@@ -86,6 +102,33 @@ def format_ist_time(dt):
     elif dt.tzinfo != IST:
         dt = dt.astimezone(IST)
     return dt.strftime('%I:%M:%S %p')
+
+def convert_to_ist(timestamp):
+    """
+    Convert timestamp to IST timezone.
+    Handles timezone-aware (UTC) and timezone-naive timestamps.
+    
+    Args:
+        timestamp: datetime object (timezone-aware or naive)
+        
+    Returns:
+        datetime object in IST timezone
+    """
+    import pytz
+    UTC = pytz.UTC
+    
+    if timestamp is None:
+        return None
+    
+    # If timezone-naive, assume it's UTC (from database)
+    if timestamp.tzinfo is None:
+        timestamp = UTC.localize(timestamp)
+    
+    # Convert to IST
+    if timestamp.tzinfo != IST:
+        timestamp = timestamp.astimezone(IST)
+    
+    return timestamp
 
 def get_credentials():
     """Get pre-configured developer credentials"""
@@ -619,12 +662,16 @@ def main():
             st.session_state.refresh_counter += 1
             st.rerun()
     
-    # Implement auto-refresh using st_autorefresh library
-    if st.session_state.auto_refresh_enabled and AUTORFR:
+    # Implement auto-refresh - Works with or without streamlit-autorefresh library
+    if st.session_state.auto_refresh_enabled:
         # This will trigger a rerun every 30 seconds
         st_autorefresh(interval=30000, limit=None, key="page_autorefresh")
     
     st.title("Enhanced Upstox F&O Option Chain Dashboard")
+    
+    # Show auto-refresh library status
+    refresh_status = "🟢 Native" if AUTORFR else "🟡 Fallback"
+    st.caption(f"Auto-refresh: {refresh_status}")
     
     # Show data source indicator
     if st.session_state.get('use_database', False):
@@ -741,11 +788,19 @@ def main():
             refresh_interval = st.slider("Refresh Interval (seconds)", 10, 60, 30)
             
             if is_market_open():
-                st.success(f"Auto-refresh enabled - Market is OPEN")
-                st.info(f"Refreshing every {refresh_interval}s")
+                st.success(f"✅ Auto-refresh enabled - Market is OPEN")
+                st.info(f"🔄 Refreshing every {refresh_interval}s")
+                
+                # Show last refresh time
+                if 'last_refresh_time' in st.session_state:
+                    import time
+                    elapsed = int(time.time() - st.session_state.last_refresh_time)
+                    st.caption(f"⏱️ Next refresh in {max(0, refresh_interval - elapsed)}s")
             else:
-                st.info("Auto-refresh paused - Market is CLOSED")
+                st.info("⏸️ Auto-refresh paused - Market is CLOSED")
                 st.write("Market hours: 9:15 AM - 3:30 PM (Mon-Fri)")
+        else:
+            st.info("🔴 Auto-refresh disabled")
     
     # Token management
     st.sidebar.subheader("Token Status")
@@ -839,9 +894,8 @@ def main():
         with tab1:
             main_content_container = st.container()
             with main_content_container:
-                # Auto-refresh implementation - FIXED: Only trigger refresh, don't duplicate UI
-                if (AUTORFR and 
-                    st.session_state.auto_refresh_enabled and 
+                # Auto-refresh implementation - Works with or without streamlit-autorefresh library
+                if (st.session_state.auto_refresh_enabled and 
                     is_market_open() and 
                     'selected_symbol' in st.session_state and 
                     st.session_state.selected_expiry):
@@ -3509,13 +3563,10 @@ def display_itm_analysis(symbol, expiry_date, db_manager, itm_count=1, hours=24)
 
 def plot_itm_oi_chart(itm_data, symbol, itm_count):
     """Plot ITM Open Interest Chart"""
-    import pytz
-    IST = pytz.timezone('Asia/Kolkata')
-    
     try:
         # Convert timestamps to IST
         itm_data_ist = itm_data.copy()
-        itm_data_ist['timestamp'] = itm_data_ist['timestamp'].apply(lambda x: x.astimezone(IST) if x.tzinfo else IST.localize(x))
+        itm_data_ist['timestamp'] = itm_data_ist['timestamp'].apply(convert_to_ist)
         
         fig, ax = plt.subplots(figsize=(14, 6))
         
@@ -3541,9 +3592,16 @@ def plot_itm_oi_chart(itm_data, symbol, itm_count):
         # Format y-axis to show large numbers properly
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format_number(x)))
         
-        # Set x-axis labels with IST times
+        # Set x-axis labels with IST times (format: HH:MM IST)
         ax.set_xticks(x_numeric)
-        ax.set_xticklabels([ts.strftime('%H:%M') for ts in itm_data_ist['timestamp']], rotation=45, ha='right')
+        # Format timestamps to show IST time clearly
+        time_labels = []
+        for ts in itm_data_ist['timestamp']:
+            if hasattr(ts, 'strftime'):
+                time_labels.append(ts.strftime('%H:%M IST'))
+            else:
+                time_labels.append(str(ts)[:5])
+        ax.set_xticklabels(time_labels, rotation=45, ha='right')
         
         plt.tight_layout()
         st.pyplot(fig)
@@ -3556,13 +3614,10 @@ def plot_itm_oi_chart(itm_data, symbol, itm_count):
 
 def plot_itm_volume_chart(itm_data, symbol, itm_count):
     """Plot ITM Volume Chart"""
-    import pytz
-    IST = pytz.timezone('Asia/Kolkata')
-    
     try:
         # Convert timestamps to IST
         itm_data_ist = itm_data.copy()
-        itm_data_ist['timestamp'] = itm_data_ist['timestamp'].apply(lambda x: x.astimezone(IST) if x.tzinfo else IST.localize(x))
+        itm_data_ist['timestamp'] = itm_data_ist['timestamp'].apply(convert_to_ist)
         
         fig, ax = plt.subplots(figsize=(14, 6))
         
@@ -3588,9 +3643,16 @@ def plot_itm_volume_chart(itm_data, symbol, itm_count):
         # Format y-axis to show large numbers properly
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: format_number(x)))
         
-        # Set x-axis labels with IST times
+        # Set x-axis labels with IST times (format: HH:MM IST)
         ax.set_xticks(x_numeric)
-        ax.set_xticklabels([ts.strftime('%H:%M') for ts in itm_data_ist['timestamp']], rotation=45, ha='right')
+        # Format timestamps to show IST time clearly
+        time_labels = []
+        for ts in itm_data_ist['timestamp']:
+            if hasattr(ts, 'strftime'):
+                time_labels.append(ts.strftime('%H:%M IST'))
+            else:
+                time_labels.append(str(ts)[:5])
+        ax.set_xticklabels(time_labels, rotation=45, ha='right')
         
         plt.tight_layout()
         st.pyplot(fig)
@@ -3603,13 +3665,10 @@ def plot_itm_volume_chart(itm_data, symbol, itm_count):
 
 def plot_itm_chgoi_chart(itm_data, symbol, itm_count):
     """Plot ITM Change in OI Chart"""
-    import pytz
-    IST = pytz.timezone('Asia/Kolkata')
-    
     try:
         # Convert timestamps to IST
         itm_data_ist = itm_data.copy()
-        itm_data_ist['timestamp'] = itm_data_ist['timestamp'].apply(lambda x: x.astimezone(IST) if x.tzinfo else IST.localize(x))
+        itm_data_ist['timestamp'] = itm_data_ist['timestamp'].apply(convert_to_ist)
         
         fig, ax = plt.subplots(figsize=(14, 6))
         
@@ -3629,9 +3688,16 @@ def plot_itm_chgoi_chart(itm_data, symbol, itm_count):
         ax.set_ylabel('Change in Open Interest', fontsize=12, fontweight='bold')
         ax.set_title(f'{symbol} - ITM ({itm_count} Strikes) Call & Put Change in OI', fontsize=14, fontweight='bold')
         
-        # Set x-axis labels
+        # Set x-axis labels with IST times (format: HH:MM IST)
         ax.set_xticks(x_numeric)
-        ax.set_xticklabels([ts.strftime('%H:%M') for ts in itm_data_ist['timestamp']], rotation=45, ha='right')
+        # Format timestamps to show IST time clearly
+        time_labels = []
+        for ts in itm_data_ist['timestamp']:
+            if hasattr(ts, 'strftime'):
+                time_labels.append(ts.strftime('%H:%M IST'))
+            else:
+                time_labels.append(str(ts)[:5])
+        ax.set_xticklabels(time_labels, rotation=45, ha='right')
         
         ax.legend(loc='best', fontsize=11)
         ax.grid(True, alpha=0.3, axis='y')

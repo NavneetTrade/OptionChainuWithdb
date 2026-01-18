@@ -8,10 +8,10 @@ import urllib.parse
 from typing import Tuple, Optional, Dict, Any
 
 
-# Upstox API endpoints
+# Upstox API endpoints (Updated to v2 API)
 BASE_URL = "https://api.upstox.com/v2"
-AUTH_URL = "https://api-v2.upstox.com/login/authorization/dialog"
-TOKEN_URL = "https://api-v2.upstox.com/login/authorization/token"
+AUTH_URL = "https://account.upstox.com/developer/apps"
+TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"  # Updated to v2 endpoint
 
 
 class UpstoxAPI:
@@ -20,6 +20,7 @@ class UpstoxAPI:
     def __init__(self):
         self.access_token = None
         self.refresh_token = None
+        self.extended_token = None  # Upstox provides extended_token for read-only operations
         
     def get_auth_url(self, api_key, redirect_uri):
         """Generate authorization URL with proper encoding"""
@@ -28,7 +29,12 @@ class UpstoxAPI:
         return uri
     
     def get_access_token(self, auth_code, api_key, api_secret, redirect_uri):
-        """Exchange authorization code for access token"""
+        """
+        Exchange authorization code for access token
+        Based on: https://upstox.com/developer/api-documentation/get-token/
+        
+        Returns access_token and extended_token (no refresh_token in Upstox API)
+        """
         try:
             payload = {
                 'code': auth_code,
@@ -39,18 +45,22 @@ class UpstoxAPI:
             }
             
             headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json'
+                'accept': 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded'
             }
             
             response = requests.post(TOKEN_URL, data=payload, headers=headers)
             if response.status_code == 200:
                 token_data = response.json()
                 self.access_token = token_data.get('access_token')
-                self.refresh_token = token_data.get('refresh_token')
+                # Upstox API provides extended_token (not refresh_token)
+                self.extended_token = token_data.get('extended_token')
+                # Note: Upstox API doesn't provide refresh_token
+                self.refresh_token = None
                 return True, token_data
             else:
-                return False, response.json() if response.text else f"HTTP {response.status_code}"
+                error_data = response.json() if response.text else {}
+                return False, error_data if error_data else f"HTTP {response.status_code}"
         except Exception as e:
             return False, str(e)
     
@@ -204,5 +214,6 @@ class UpstoxAPI:
                 return None, response.json() if response.text else f"HTTP {response.status_code}"
         except Exception as e:
             return None, str(e)
+
 
 

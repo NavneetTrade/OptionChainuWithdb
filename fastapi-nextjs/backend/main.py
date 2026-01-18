@@ -1,12 +1,12 @@
 """
 FastAPI Backend - Option Chain Analysis
-Reuses all existing Python code, just adds REST API + WebSocket
+Reuses all existing Python code, just adds REST API
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from typing import List, Optional, Dict, Any
+from typing import Optional, Dict, Any
 import asyncio
 import json
 import logging
@@ -32,69 +32,14 @@ logger = logging.getLogger(__name__)
 # Database connection
 db = TimescaleDBManager()
 
-# Active WebSocket connections for real-time updates
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-        logger.info(f"Client connected. Total connections: {len(self.active_connections)}")
-
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-        logger.info(f"Client disconnected. Total connections: {len(self.active_connections)}")
-
-    async def broadcast(self, message: dict):
-        """Send message to all connected clients"""
-        disconnected = []
-        for connection in self.active_connections:
-            try:
-                await connection.send_json(message)
-            except Exception as e:
-                logger.error(f"Error sending to client: {e}")
-                disconnected.append(connection)
-        
-        # Remove disconnected clients
-        for conn in disconnected:
-            self.active_connections.remove(conn)
-
-manager = ConnectionManager()
-
-# Background task for real-time updates
-async def broadcast_updates():
-    """Send real-time updates to all connected clients"""
-    while True:
-        try:
-            # Fetch latest data from database
-            latest_data = await get_latest_gamma_data()
-            
-            if latest_data:
-                await manager.broadcast({
-                    "type": "gamma_update",
-                    "data": latest_data,
-                    "timestamp": datetime.now().isoformat()
-                })
-            
-            # Update every 5 seconds
-            await asyncio.sleep(5)
-            
-        except Exception as e:
-            logger.error(f"Error in broadcast loop: {e}")
-            await asyncio.sleep(5)
-
 # Lifespan context for startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("🚀 FastAPI server starting...")
-    # Start background task for real-time updates
-    task = asyncio.create_task(broadcast_updates())
     yield
     # Shutdown
     logger.info("🛑 FastAPI server shutting down...")
-    task.cancel()
 
 # Create FastAPI app
 app = FastAPI(
@@ -143,6 +88,16 @@ async def get_symbols():
         return {"symbols": symbols, "count": len(symbols)}
     except Exception as e:
         logger.error(f"Error fetching symbols: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/gamma/all")
+async def get_all_gamma_data():
+    """Get latest gamma data for all symbols - used by HTTP polling"""
+    try:
+        data = await get_latest_gamma_data()
+        return {"data": data, "count": len(data), "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Error fetching all gamma data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/gamma/{symbol}")
@@ -1123,45 +1078,6 @@ async def get_top_gamma_blasts(limit: int = 10):
     except Exception as e:
         logger.error(f"Error fetching top blasts: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# ============================================================================
-# WEBSOCKET ENDPOINT (Real-time Updates)
-# ============================================================================
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time data streaming"""
-    await manager.connect(websocket)
-    
-    try:
-        # Send initial data on connect
-        initial_data = await get_latest_gamma_data()
-        await websocket.send_json({
-            "type": "initial",
-            "data": initial_data
-        })
-        
-        # Keep connection alive and listen for client messages
-        while True:
-            data = await websocket.receive_text()
-            # Client can request specific symbol updates
-            message = json.loads(data)
-            
-            if message.get("type") == "subscribe":
-                symbol = message.get("symbol")
-                # Send symbol-specific data
-                symbol_data = await get_gamma_exposure(symbol)
-                await websocket.send_json({
-                    "type": "symbol_update",
-                    "symbol": symbol,
-                    "data": symbol_data
-                })
-                
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        manager.disconnect(websocket)
 
 # ============================================================================
 # HELPER FUNCTIONS

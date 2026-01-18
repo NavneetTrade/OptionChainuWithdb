@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import axios from 'axios'
+import { formatISTTimeAMPM } from '../utils/timeUtils'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -90,12 +91,12 @@ export default function IndicesOverview({ onSymbolClick, selectedSymbol, liveDat
           <div className="mb-3">
             <div className="flex items-center justify-between text-sm mb-1">
               <span className="text-gray-400">Blast Probability</span>
-              <span className="font-semibold">{(index.gamma_blast_probability * 100).toFixed(1)}%</span>
+              <span className="font-semibold">{((index.gamma_blast_probability ?? 0) * 100).toFixed(1)}%</span>
             </div>
             <div className="w-full bg-gray-700 rounded-full h-2">
               <div
                 className={`h-2 rounded-full ${getBlastColor(index.gamma_blast_probability)}`}
-                style={{ width: `${index.gamma_blast_probability * 100}%` }}
+                style={{ width: `${(index?.gamma_blast_probability ?? 0) * 100}%` }}
               />
             </div>
           </div>
@@ -105,23 +106,23 @@ export default function IndicesOverview({ onSymbolClick, selectedSymbol, liveDat
             <div>
               <span className="text-gray-400">GEX:</span>
               <span className="ml-1 font-mono">
-                {(index.net_gex / 1_000_000).toFixed(1)}M
+                {((index.net_gex ?? 0) / 1_000_000).toFixed(1)}M
               </span>
             </div>
             <div>
               <span className="text-gray-400">IV:</span>
-              <span className="ml-1 font-mono">{index.atm_iv.toFixed(2)}%</span>
+              <span className="ml-1 font-mono">{(index.atm_iv ?? 0).toFixed(2)}%</span>
             </div>
             <div>
               <span className="text-gray-400">OI Vel:</span>
               <span className={`ml-1 font-mono ${index.oi_velocity > 0 ? 'text-gamma-green' : 'text-gamma-red'}`}>
-                {index.oi_velocity > 0 ? '+' : ''}{index.oi_velocity.toFixed(1)}
+                {index.oi_velocity > 0 ? '+' : ''}{(index.oi_velocity ?? 0).toFixed(1)}
               </span>
             </div>
             <div>
               <span className="text-gray-400">IV Vel:</span>
               <span className={`ml-1 font-mono ${index.iv_velocity > 0 ? 'text-gamma-green' : 'text-gamma-red'}`}>
-                {index.iv_velocity > 0 ? '+' : ''}{(index.iv_velocity * 100).toFixed(2)}%
+                {index.iv_velocity > 0 ? '+' : ''}{((index.iv_velocity ?? 0) * 100).toFixed(2)}%
               </span>
             </div>
           </div>
@@ -129,7 +130,7 @@ export default function IndicesOverview({ onSymbolClick, selectedSymbol, liveDat
           {/* Timestamp */}
           <div className="mt-3 pt-2 border-t border-gray-700">
             <span className="text-xs text-gray-500">
-              {new Date(index.timestamp).toLocaleTimeString()}
+              {formatISTTimeAMPM(index.timestamp)}
             </span>
           </div>
         </div>

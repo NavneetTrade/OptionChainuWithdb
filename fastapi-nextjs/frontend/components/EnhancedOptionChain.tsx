@@ -501,7 +501,7 @@ export default function EnhancedOptionChain() {
         <>
           {/* Spot Price Banner */}
           <div className="bg-gradient-to-r from-blue-600 to-blue-700 rounded-lg p-4 text-white text-center">
-            <div className="text-2xl font-bold">{symbol} Spot: ₹{optionChainData.spot_price.toFixed(2)}</div>
+            <div className="text-2xl font-bold">{symbol} Spot: ₹{(optionChainData?.spot_price ?? 0).toFixed(2)}</div>
             <div className="text-sm opacity-90">Expiry: {formatDate(expiry)} | Last Update: {new Date(optionChainData.timestamp).toLocaleTimeString()}</div>
           </div>
 

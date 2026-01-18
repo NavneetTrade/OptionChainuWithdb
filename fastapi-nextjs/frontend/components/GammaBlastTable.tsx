@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import axios from 'axios'
+import { formatISTTimeAMPM } from '../utils/timeUtils'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -78,7 +79,7 @@ export default function GammaBlastTable({ onSymbolClick, liveData }: GammaBlastT
                 <td className="px-4 py-3 font-semibold">{blast.symbol}</td>
                 <td className="px-4 py-3 text-center">
                   <span className={`px-3 py-1 rounded-full text-sm font-semibold ${getProbabilityBadge(blast.probability)}`}>
-                    {(blast.probability * 100).toFixed(1)}%
+                    {((blast.probability ?? 0) * 100).toFixed(1)}%
                   </span>
                 </td>
                 <td className="px-4 py-3 text-center">
@@ -92,18 +93,18 @@ export default function GammaBlastTable({ onSymbolClick, liveData }: GammaBlastT
                 </td>
                 <td className="px-4 py-3 text-center text-sm">{blast.confidence}</td>
                 <td className="px-4 py-3 text-right font-mono text-sm">
-                  {(blast.net_gex / 1_000_000).toFixed(2)}M
+                  {((blast.net_gex ?? 0) / 1_000_000).toFixed(2)}M
                 </td>
                 <td className="px-4 py-3 text-right font-mono text-sm">
-                  {blast.atm_iv.toFixed(2)}%
+                  {(blast.atm_iv ?? 0).toFixed(2)}%
                 </td>
                 <td className={`px-4 py-3 text-right font-mono text-sm font-semibold ${
                   blast.oi_velocity > 0 ? 'text-gamma-green' : 'text-gamma-red'
                 }`}>
-                  {blast.oi_velocity > 0 ? '+' : ''}{blast.oi_velocity.toFixed(1)}
+                  {blast.oi_velocity > 0 ? '+' : ''}{(blast.oi_velocity ?? 0).toFixed(1)}
                 </td>
                 <td className="px-4 py-3 text-right text-xs text-gray-400">
-                  {new Date(blast.timestamp).toLocaleTimeString()}
+                  {formatISTTimeAMPM(blast.timestamp)}
                 </td>
               </tr>
             ))}

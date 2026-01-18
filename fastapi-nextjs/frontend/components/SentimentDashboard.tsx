@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import axios from 'axios'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
+import { formatISTTimeForChart } from '../utils/timeUtils'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -85,7 +86,7 @@ export default function SentimentDashboard() {
   const formatChartData = () => {
     if (!data) return []
     return data.history.map(item => ({
-      time: new Date(item.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+      time: formatISTTimeForChart(item.timestamp),
       score: item.sentiment_score,
       pcr_oi: item.pcr_oi,
       pcr_volume: item.pcr_volume,

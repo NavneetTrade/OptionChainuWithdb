@@ -20,14 +20,10 @@ from dataclasses import dataclass
 
 from database import TimescaleDBManager
 from upstox_api import UpstoxAPI
+from token_manager import get_token_manager
+from auto_token_refresh import UpstoxTokenRefresher
 
-# Optional WebSocket import - not required since we're using REST API only
-try:
-    from websocket_manager import UpstoxWebSocketManager
-    WEBSOCKET_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
-    WEBSOCKET_AVAILABLE = False
-    UpstoxWebSocketManager = None
+# WebSocket implementation removed - using REST API only
 
 # Configure logging
 logging.basicConfig(
@@ -416,29 +412,27 @@ class AdaptiveGammaBlastDetector:
 class OptionChainBackgroundService:
     """Background service for fetching option chain data for all symbols"""
     
-    def __init__(self, refresh_interval: int = 180, force_run: bool = False):
+    def __init__(self, refresh_interval: int = 180, force_mode: bool = False):
         """
-        Initialize background service - HYBRID MODE
+        Initialize background service - REST API MODE
         
         Args:
             refresh_interval: REST API refresh interval in seconds (180 = 3 minutes for stocks)
-            force_run: If True, run even when market is closed (for testing)
+            force_mode: If True, bypasses market hours check (useful for testing)
         """
         self.refresh_interval = refresh_interval
         self.index_refresh_interval = 90  # Indices refresh every 90 seconds (avoid rate limits)
-        self.force_run = force_run
         self.running = False
         self.db_manager = None
         self.upstox_api = None
-        self.websocket_manager = None
+        self.token_manager = None
         self.symbol_configs = {}
         self.executor = None
-        self.use_websocket = True  # ENABLED for real-time indices
         self.expiry_cache = {}  # Cache expiry dates to avoid repeated API calls
+        self.force_mode = force_mode  # Force mode bypasses market hours check
         
-        # WebSocket configuration for real-time indices
+        # Fast refresh indices (using REST API)
         self.realtime_indices = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY']
-        self.ws_data_cache = {}  # Cache for WebSocket real-time data
         
         # Initialize adaptive gamma blast detector
         self.gamma_detector = AdaptiveGammaBlastDetector(lookback_periods=20)
@@ -493,34 +487,23 @@ class OptionChainBackgroundService:
                 logger.warning("Service will continue but database operations will be disabled")
                 self.db_manager = None
             
-            # Initialize Upstox API
-            self.upstox_api = UpstoxAPI()
-            self.upstox_api.access_token = self.credentials['access_token']
-            logger.info("Upstox API initialized")
+            # Initialize token manager for auto-refresh
+            self.token_manager = get_token_manager()
+            logger.info("Token manager initialized")
             
-            # WebSocket enabled for real-time indices
-            if self.use_websocket and WEBSOCKET_AVAILABLE:
-                try:
-                    self.websocket_manager = UpstoxWebSocketManager(self.credentials['access_token'])
-                    self.websocket_manager.start()
-                    # Wait a bit for WebSocket to connect
-                    time.sleep(2)
-                    if self.websocket_manager.is_connected:
-                        logger.info("✅ WebSocket manager initialized and connected")
-                        # Subscribe to indices for real-time updates
-                        self._subscribe_realtime_indices()
-                    else:
-                        logger.warning("WebSocket manager started but not connected. Indices will use 3-min refresh.")
-                        self.use_websocket = False
-                        self.websocket_manager = None
-                except Exception as ws_error:
-                    logger.warning(f"WebSocket initialization failed: {ws_error}. Falling back to REST API (3-min) for all symbols.")
-                    self.use_websocket = False
-                    self.websocket_manager = None
-            elif self.use_websocket and not WEBSOCKET_AVAILABLE:
-                logger.info("WebSocket requested but 'websockets' module not installed. Using REST API only.")
-                self.use_websocket = False
-                self.websocket_manager = None
+            # Initialize Upstox token refresher (handles extended_token per Upstox API v2)
+            try:
+                from auto_token_refresh import UpstoxTokenRefresher
+                self.token_refresher = UpstoxTokenRefresher()
+                logger.info("Upstox token refresher initialized (API v2)")
+            except Exception as e:
+                logger.warning(f"Could not initialize token refresher: {e}")
+                self.token_refresher = None
+            
+            # Initialize Upstox API with auto-refresh token
+            self.upstox_api = UpstoxAPI()
+            self._refresh_access_token_if_needed()
+            logger.info("Upstox API initialized (REST API only)")
             
             # Initialize thread pool executor with reduced workers to avoid rate limiting
             # REAL-TIME OPTIMIZATION: 5 workers for parallel processing
@@ -531,90 +514,68 @@ class OptionChainBackgroundService:
             logger.error(f"Failed to initialize components: {e}")
             raise
     
-    def _subscribe_realtime_indices(self):
-        """Subscribe to WebSocket for real-time index updates"""
-        if not self.websocket_manager or not self.websocket_manager.is_connected:
-            return
-        
-        try:
-            # Get instrument keys for indices
-            index_instruments = [
-                "NSE_INDEX|Nifty 50",
-                "NSE_INDEX|Nifty Bank",
-                "NSE_INDEX|Nifty Fin Service",
-                "NSE_INDEX|NIFTY MID SELECT",
-                "BSE_INDEX|SENSEX"
-            ]
-            
-            # Subscribe to indices using async
-            import asyncio
-            if self.websocket_manager.loop:
-                asyncio.run_coroutine_threadsafe(
-                    self.websocket_manager.subscribe(index_instruments, mode='ltpc'),
-                    self.websocket_manager.loop
-                )
-                logger.info(f"⚡ Subscribed to {len(index_instruments)} indices for real-time updates")
-        except Exception as e:
-            logger.error(f"Failed to subscribe to indices: {e}")
     
-    def _get_realtime_spot_price(self, symbol: str, instrument_key: str) -> Optional[float]:
-        """Get real-time spot price from WebSocket if available"""
-        if not self.use_websocket or not self.websocket_manager:
-            return None
-        
+    def _refresh_access_token_if_needed(self):
+        """
+        Refresh access token if expired (automatic)
+        Uses Upstox API v2 endpoint and handles extended_token
+        Based on: https://upstox.com/developer/api-documentation/get-token/
+        """
         try:
-            # Check if we have real-time data
-            if instrument_key in self.websocket_manager.latest_data:
-                feed_data = self.websocket_manager.latest_data[instrument_key]
-                # Extract LTP (Last Traded Price)
-                if 'ltpc' in feed_data:
-                    ltp = feed_data['ltpc'].get('ltp', 0)
-                    if ltp > 0:
-                        logger.debug(f"⚡ {symbol}: Real-time price {ltp}")
-                        return float(ltp)
-                elif 'ltp' in feed_data:
-                    return float(feed_data['ltp'])
+            # First, try to use extended_token if available (Upstox API v2 feature)
+            if self.token_refresher:
+                is_expired = self.token_refresher.check_token_expiration()
+                if is_expired:
+                    logger.info("🔄 Access token expired, checking for extended_token...")
+                    if self.token_refresher.use_extended_token_if_available():
+                        logger.info("✅ Switched to extended_token for read-only operations")
+                        # Reload credentials
+                        self._load_credentials()
+                        self.upstox_api.access_token = self.credentials.get('access_token')
+                        return True
+            
+            # Check if we have refresh_token in credentials (legacy support)
+            refresh_token = self.credentials.get('refresh_token')
+            if not refresh_token:
+                # Try to get from token manager
+                refresh_token = self.token_manager.get_refresh_token()
+                if refresh_token:
+                    # Update credentials with refresh token
+                    self.credentials['refresh_token'] = refresh_token
+                    logger.debug("Found refresh_token in token manager")
+            
+            # Get token with auto-refresh enabled
+            access_token = self.token_manager.get_access_token(
+                auto_refresh=True,
+                api_key=self.credentials.get('api_key'),
+                api_secret=self.credentials.get('api_secret')
+            )
+            
+            if access_token:
+                old_token = self.upstox_api.access_token
+                self.upstox_api.access_token = access_token
+                # Also update credentials for consistency
+                self.credentials['access_token'] = access_token
+                
+                # Log if token changed
+                if old_token != access_token:
+                    logger.info(f"✅ Access token updated: {access_token[:20]}...")
+                
+                return True
+            else:
+                logger.warning("⚠️ Could not get access token")
+                logger.warning("   Note: Upstox tokens expire at 3:30 AM daily (per API documentation)")
+                logger.warning("   You may need to re-authenticate to get a new token")
+                # Fallback to credentials file token
+                self.upstox_api.access_token = self.credentials.get('access_token')
+                return False
         except Exception as e:
-            logger.debug(f"Error getting real-time price for {symbol}: {e}")
-        
-        return None
-    
-    def _handle_websocket_tick(self, tick_data):
-        """Handle real-time WebSocket tick data for indices"""
-        try:
-            if not tick_data:
-                return
-            
-            # Extract symbol and data
-            instrument_key = tick_data.get('instrument_key', '')
-            ltp = tick_data.get('ltp', 0)
-            
-            # Map instrument key to symbol
-            instrument_map = {
-                "NSE_INDEX|Nifty 50": "NIFTY",
-                "NSE_INDEX|Nifty Bank": "BANKNIFTY",
-                "NSE_INDEX|Nifty Fin Service": "FINNIFTY",
-                "NSE_INDEX|NIFTY MID SELECT": "MIDCPNIFTY",
-                "BSE_INDEX|SENSEX": "SENSEX"
-            }
-            
-            symbol = instrument_map.get(instrument_key)
-            if not symbol or symbol not in self.realtime_indices:
-                return
-            
-            # Cache real-time data
-            self.ws_data_cache[symbol] = {
-                'spot_price': ltp,
-                'timestamp': datetime.now(IST),
-                'instrument_key': instrument_key
-            }
-            
-            # Update database with real-time spot price
-            # This will be merged with periodic option chain data
-            logger.debug(f"⚡ {symbol}: Real-time price {ltp}")
-            
-        except Exception as e:
-            logger.error(f"Error handling WebSocket tick: {e}")
+            logger.error(f"Error refreshing access token: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            # Fallback to credentials file token
+            self.upstox_api.access_token = self.credentials.get('access_token')
+            return False
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully"""
@@ -624,6 +585,10 @@ class OptionChainBackgroundService:
     
     def _is_market_open(self) -> bool:
         """Check if market is currently open"""
+        # Force mode bypasses market hours check
+        if self.force_mode:
+            return True
+        
         now = datetime.now(IST)
         current_time = now.time()
         weekday = now.weekday()
@@ -1008,22 +973,14 @@ class OptionChainBackgroundService:
                 logger.warning(f"No data returned for {symbol}")
                 return False
             
-            # Extract spot price from API response or WebSocket (for indices)
+            # Extract spot price from API response
             spot_price = 0
-            
-            # Try real-time price first for indices (from WebSocket)
-            realtime_price = self._get_realtime_spot_price(symbol, instrument_key)
-            if realtime_price:
-                spot_price = realtime_price
-                logger.debug(f"⚡ Using real-time WebSocket price for {symbol}: {spot_price}")
-            else:
-                # Fall back to API response
-                if 'underlying_spot_price' in option_data:
-                    spot_price = float(option_data.get('underlying_spot_price', 0))
-                elif option_data['data'] and len(option_data['data']) > 0:
-                    first_strike = option_data['data'][0]
-                    # Try to get spot from strike data
-                    spot_price = first_strike.get('underlying_spot_price', 0) or first_strike.get('strike_price', 0)
+            if 'underlying_spot_price' in option_data:
+                spot_price = float(option_data.get('underlying_spot_price', 0))
+            elif option_data.get('data') and len(option_data['data']) > 0:
+                first_strike = option_data['data'][0]
+                # Try to get spot from strike data
+                spot_price = first_strike.get('underlying_spot_price', 0) or first_strike.get('strike_price', 0)
             
             # If still 0, try to infer from strikes (use middle strike as approximation)
             if spot_price == 0 and option_data['data']:
@@ -1856,8 +1813,8 @@ class OptionChainBackgroundService:
     
     def _fetch_all_symbols(self):
         """Fetch data for all active symbols - OPTIMIZED FOR REAL-TIME"""
-        # Check if market is open (unless force_run is enabled for testing)
-        if not self.force_run and not self._is_market_open():
+        # Check if market is open
+        if not self._is_market_open():
             logger.info("Market is closed. Skipping data fetch. UI will show last fetched data from database.")
             return
         
@@ -1875,8 +1832,7 @@ class OptionChainBackgroundService:
             return
         
         logger.info(f"📡 Fetching {len(symbols)} stock symbols via REST API (3-min cycle)...")
-        if self.use_websocket:
-            logger.info(f"⚡ {len(self.realtime_indices)} indices updating every {self.index_refresh_interval}s via fast refresh thread")
+        logger.info(f"⚡ {len(self.realtime_indices)} indices updating every {self.index_refresh_interval}s via fast refresh thread")
         
         # HYBRID OPTIMIZATION:
         # - Indices: Fast refresh thread (90-second updates)
@@ -1947,7 +1903,7 @@ class OptionChainBackgroundService:
                 # Check if it's time to refresh (every 30 seconds)
                 if now - last_refresh >= self.index_refresh_interval:
                     # Check market status
-                    if not self.force_run and not self._is_market_open():
+                    if not self._is_market_open():
                         logger.debug("Market closed, skipping index refresh")
                         time.sleep(60)
                         continue
@@ -1991,17 +1947,20 @@ class OptionChainBackgroundService:
             return
         
         self.running = True
-        logger.info("🚀 Starting Option Chain Background Service - HYBRID MODE")
+        mode_str = "REST API MODE"
+        if self.force_mode:
+            mode_str += " [FORCE MODE - Market hours check disabled]"
+        logger.info(f"🚀 Starting Option Chain Background Service - {mode_str}")
         logger.info("=" * 70)
         
-        if self.use_websocket and self.websocket_manager:
-            logger.info("⚡ REAL-TIME: Indices (WebSocket streaming)")
-            logger.info(f"   • {', '.join(self.realtime_indices)}")
-            logger.info("   • Update latency: < 1 second")
-        else:
-            logger.info(f"⚡ FAST REFRESH: Indices (REST API)")
-            logger.info(f"   • {', '.join(self.realtime_indices)}")
-            logger.info(f"   • Refresh interval: {self.index_refresh_interval} seconds")
+        if self.force_mode:
+            logger.warning("⚠️  FORCE MODE ENABLED: Service will run regardless of market hours")
+            logger.warning("   This is useful for testing but should be disabled in production")
+            logger.info("")
+        
+        logger.info(f"⚡ FAST REFRESH: Indices (REST API)")
+        logger.info(f"   • {', '.join(self.realtime_indices)}")
+        logger.info(f"   • Refresh interval: {self.index_refresh_interval} seconds")
         logger.info("")
         
         logger.info(f"📊 PERIODIC: All stocks (REST API)")
@@ -2020,38 +1979,52 @@ class OptionChainBackgroundService:
             logger.error(f"Error during startup cleanup: {e}")
         
         # Start separate thread for fast index refresh
-        if not self.use_websocket:
-            index_thread = threading.Thread(target=self._fast_index_refresh_loop, daemon=True)
-            index_thread.start()
-            logger.info("⚡ Started fast refresh thread for indices (90-second updates)")
+        index_thread = threading.Thread(target=self._fast_index_refresh_loop, daemon=True)
+        index_thread.start()
+        logger.info("⚡ Started fast refresh thread for indices (90-second updates)")
         
         consecutive_errors = 0
         max_consecutive_errors = 10  # Allow 10 consecutive errors before stopping
+        last_token_check = 0
+        token_check_interval = 300  # Check token every 5 minutes
         
         try:
             while self.running:
                 start_time = time.time()
                 
                 try:
-                    # Check market status
-                    if not self.force_run and not self._is_market_open():
-                        # Market is closed - wait and check again
-                        now = datetime.now(IST)
-                        current_time = now.time()
-                        market_close = datetime.strptime("15:30", "%H:%M").time()
-                        
-                        # If it's after 3:30 PM, stop the service until next market open
-                        if current_time > market_close:
-                            logger.info(f"Market closed at 3:30 PM. Current time: {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
-                            logger.info("Background service will stop fetching data. Dashboard will display data until 3:30 PM.")
-                            logger.info("Restart the service tomorrow during market hours (9:15 AM - 3:30 PM).")
-                            self.stop()
-                            break
+                    # Periodically check and refresh token if needed (every 5 minutes)
+                    now = time.time()
+                    if now - last_token_check >= token_check_interval:
+                        logger.info("🔄 Periodic token check (every 5 minutes)...")
+                        if self._refresh_access_token_if_needed():
+                            logger.info("✅ Token refreshed during periodic check")
+                        last_token_check = now
+                    
+                    # Check market status (unless force mode is enabled)
+                    if not self._is_market_open():
+                        if self.force_mode:
+                            # Force mode: continue even when market is closed
+                            logger.info("⚠️  Force mode: Market is closed but continuing to fetch data...")
                         else:
-                            logger.info(f"Market not yet open (Current time: {now.strftime('%Y-%m-%d %H:%M:%S IST')}). Waiting 60 seconds...")
-                            logger.info("Market hours: 9:15 AM - 3:30 PM IST (Monday-Friday)")
-                            time.sleep(60)  # Check every minute when market is closed
-                        continue
+                            # Market is closed - wait and check again
+                            now = datetime.now(IST)
+                            current_time = now.time()
+                            market_close = datetime.strptime("15:30", "%H:%M").time()
+                            
+                            # If it's after 3:30 PM, stop the service until next market open
+                            if current_time > market_close:
+                                logger.info(f"Market closed at 3:30 PM. Current time: {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
+                                logger.info("Background service will stop fetching data. Dashboard will display data until 3:30 PM.")
+                                logger.info("Restart the service tomorrow during market hours (9:15 AM - 3:30 PM).")
+                                logger.info("Or use --force flag to run during market closed hours for testing.")
+                                self.stop()
+                                break
+                            else:
+                                logger.info(f"Market not yet open (Current time: {now.strftime('%Y-%m-%d %H:%M:%S IST')}). Waiting 60 seconds...")
+                                logger.info("Market hours: 9:15 AM - 3:30 PM IST (Monday-Friday)")
+                                time.sleep(60)  # Check every minute when market is closed
+                            continue
                     
                     # Market is open - fetch data
                     logger.info("Market is open. Fetching data for all symbols...")
@@ -2064,11 +2037,62 @@ class OptionChainBackgroundService:
                     consecutive_errors += 1
                     error_str = str(fetch_error)
                     
+                    # Check if it's a token expiration error (UDAPI100050)
+                    is_token_error = any(keyword in error_str for keyword in 
+                        ['UDAPI100050', 'Invalid token', 'token expired', 'authentication failed'])
+                    
                     # Check if it's a network/connection error
                     is_network_error = any(keyword in error_str.lower() for keyword in 
                         ['connection', 'timeout', 'network', 'unreachable', 'resolve', 'dns'])
                     
-                    if is_network_error:
+                    if is_token_error:
+                        logger.warning("=" * 70)
+                        logger.warning("⚠️ UPSTOX API TOKEN EXPIRED OR INVALID - Attempting auto-refresh...")
+                        logger.warning(f"Error: {fetch_error}")
+                        logger.warning("=" * 70)
+                        
+                        # Attempt automatic token refresh (fully automatic, no manual steps needed)
+                        logger.info("🔄 Attempting automatic token refresh...")
+                        if self._refresh_access_token_if_needed():
+                            logger.info("✅ Token automatically refreshed! Continuing with new token...")
+                            consecutive_errors = 0  # Reset error count on successful refresh
+                            time.sleep(5)  # Brief pause before retry
+                        else:
+                            # Auto-refresh failed - try to get refresh_token from token file
+                            logger.warning("⚠️ Auto-refresh failed. Checking for refresh_token in token file...")
+                            try:
+                                import json
+                                from pathlib import Path
+                                token_file = Path('data/upstox_tokens.json')
+                                if token_file.exists():
+                                    with open(token_file) as f:
+                                        token_data = json.load(f)
+                                    refresh_token = token_data.get('refresh_token')
+                                    if refresh_token:
+                                        logger.info("📦 Found refresh_token in token file, updating secrets.toml...")
+                                        self.credentials['refresh_token'] = refresh_token
+                                        # Try refresh again with the found refresh_token
+                                        if self._refresh_access_token_if_needed():
+                                            logger.info("✅ Token automatically refreshed using refresh_token from token file!")
+                                            consecutive_errors = 0
+                                            time.sleep(5)
+                                            continue
+                            except Exception as e:
+                                logger.debug(f"Error checking token file: {e}")
+                            
+                            logger.error("❌ Automatic token refresh failed!")
+                            logger.error("⚠️  The system cannot automatically refresh the token.")
+                            logger.error("   This usually means:")
+                            logger.error("   1. No refresh_token is available")
+                            logger.error("   2. The refresh_token has expired")
+                            logger.error("   3. API credentials are invalid")
+                            logger.error("")
+                            logger.error("   SOLUTION: Re-authenticate with Upstox to get new tokens.")
+                            logger.error("   The system will continue retrying, but data collection will fail until tokens are updated.")
+                            logger.error("=" * 70)
+                            logger.error(f"Token error detected (attempt {consecutive_errors}/{max_consecutive_errors})")
+                            time.sleep(60)  # Wait longer for token errors
+                    elif is_network_error:
                         logger.warning(f"Network error detected (attempt {consecutive_errors}/{max_consecutive_errors}): {fetch_error}")
                         logger.info("Waiting 30 seconds before retry...")
                         time.sleep(30)
@@ -2076,10 +2100,18 @@ class OptionChainBackgroundService:
                         logger.error(f"Error in fetch cycle (attempt {consecutive_errors}/{max_consecutive_errors}): {fetch_error}")
                         time.sleep(10)
                     
-                    # Only stop if we've had too many consecutive errors
-                    if consecutive_errors >= max_consecutive_errors:
+                    # Only stop if we've had too many consecutive errors (but allow more for token errors)
+                    max_errors_for_token = max_consecutive_errors * 2  # Allow more retries for token errors
+                    error_limit = max_errors_for_token if is_token_error else max_consecutive_errors
+                    
+                    if consecutive_errors >= error_limit:
+                        logger.error("=" * 70)
                         logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping service.")
-                        logger.error("Please check your internet connection and API credentials.")
+                        if is_token_error:
+                            logger.error("CRITICAL: Token expiration detected. Please update your Upstox API token.")
+                        else:
+                            logger.error("Please check your internet connection and API credentials.")
+                        logger.error("=" * 70)
                         self.stop()
                         break
                     
@@ -2109,10 +2141,6 @@ class OptionChainBackgroundService:
         logger.info("Stopping background service...")
         self.running = False
         
-        if self.websocket_manager:
-            self.websocket_manager.stop()
-            logger.info("WebSocket manager stopped")
-        
         if self.executor:
             self.executor.shutdown(wait=True)
             logger.info("Thread pool executor shut down")
@@ -2138,12 +2166,12 @@ def main():
     parser.add_argument(
         '--force',
         action='store_true',
-        help='Run even when market is closed (for testing)'
+        help='Force mode: Run service regardless of market hours (useful for testing)'
     )
     
     args = parser.parse_args()
     
-    service = OptionChainBackgroundService(refresh_interval=args.interval, force_run=args.force)
+    service = OptionChainBackgroundService(refresh_interval=args.interval, force_mode=args.force)
     
     try:
         service.start()

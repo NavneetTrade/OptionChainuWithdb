@@ -15,6 +15,9 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Verify streamlit-autorefresh is installed
+RUN python -c "from streamlit_autorefresh import st_autorefresh; print('✓ streamlit-autorefresh installed')" || echo "⚠ streamlit-autorefresh not found"
+
 # Copy application code
 COPY . .
 
